@@ -1,0 +1,9 @@
+{:lint-as
+ {taoensso.trove/log! clojure.core/identity}
+
+ :linters
+ {:unresolved-symbol      {:level :error}
+  :unused-binding         {:level :warning}
+  :unused-namespace       {:level :warning}
+  :missing-docstring      {:level :off}
+  :refer-all              {:level :error}}}

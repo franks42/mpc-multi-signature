@@ -1,0 +1,425 @@
+;; Statechart: Recovery reshare ceremony (UC2)
+;;
+;; Source: data-dictionary.edn :ceremony/reshare-recovery
+;;
+;; Models the orchestrator-side per-ceremony lifecycle of a recovery
+;; reshare ceremony. The holder has lost their share. Figure, the IC,
+;; and a fresh new_holder identity participate; old holder is
+;; excluded. Outcome: a fresh shareset of the SAME public key for
+;; the new participant set.
+;;
+;; This is the most complex of the first three statecharts. It adds:
+;;
+;;   - A multi-party authorization gate. Both Figure AND the IC must
+;;     independently verify attestations and intent before agreeing to
+;;     participate. Either can refuse, and the ceremony does not
+;;     proceed without both agreeing.
+;;
+;;   - An optional objection window. Per address policy, the ceremony
+;;     may be required to publish intent and wait for an objection
+;;     window to elapse before proceeding. This is a stronger
+;;     dispute-defense posture for high-value wallets.
+;;
+;;   - A consistency check at finalization that verifies the new
+;;     public key equals the original public key (the load-bearing
+;;     UC2 invariant).
+;;
+;; This chart inherits from the keygen template structurally but the
+;; pre-protocol gating is substantially more involved.
+
+{:statechart/id           :statechart/ceremony-reshare-recovery
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/reshare-recovery
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle"
+ :statechart/template     :statechart/ceremony-keygen
+
+ :statechart/context
+ {:ceremony/id              :uuid
+  :ceremony/old-participants [:actor/holder ; old holder; will be excluded
+                              :actor/figure
+                              :actor/independent-custodian]
+  :ceremony/new-participants [:actor/holder ; new_holder identity, fresh
+                              :actor/figure
+                              :actor/independent-custodian]
+  :ceremony/coordinator     :actor/figure
+  :ceremony/old-threshold   2
+  :ceremony/new-threshold   2
+  :ceremony/scheme          :scheme/ot-based-ecdsa-secp256k1
+  :ceremony/deadline        :timestamp
+  :ceremony/wallet-pk       nil ; original public key, must be preserved
+  :ceremony/attestation     nil ; :crypto/identity-attestation or alternative
+  :ceremony/recovery-intent nil ; :crypto/recovery-intent
+  :ceremony/objection-window-required? false ; from address policy
+  :ceremony/objection-window-deadline  nil
+  :ceremony/figure-gate-status :gate-status/pending  ; :pending, :passed, :rejected
+  :ceremony/ic-gate-status     :gate-status/pending
+  :ceremony/per-party-state {:actor/figure              :party-state/awaiting
+                             :actor/independent-custodian :party-state/awaiting
+                             :actor/holder              :party-state/awaiting} ; new_holder
+  :ceremony/results         {}
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  {:on {:event/begin-ceremony
+        {:target :state/authorization-gate
+         :actions [:action/record-deadline
+                   :action/load-address-policy
+                   :action/extract-attestation-and-intent]}
+
+        :event/cancel
+        {:target :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/authorization-gate
+  ;; Both Figure and the IC independently verify the attestation and
+  ;; recovery intent. Each emits a gate-pass or gate-fail event
+  ;; carrying their identity. The ceremony advances only when BOTH
+  ;; have passed; if EITHER rejects, the ceremony aborts.
+  ;;
+  ;; This is the multi-party authorization that distinguishes recovery
+  ;; ceremonies from simpler ones. The independence of the two
+  ;; verifications is load-bearing: if Figure could vouch for the IC's
+  ;; verification, the IC's independence is hollow.
+  {:entry [:action/dispatch-gate-verification-to-figure
+           :action/dispatch-gate-verification-to-ic]
+   :on   {:event/figure-gate-pass
+          {:target :state/authorization-gate
+           :actions [:action/record-figure-gate-pass
+                     :action/check-both-gates-passed]}
+
+          :event/figure-gate-fail
+          {:target :state/aborting
+           :actions [:action/record-figure-gate-fail]}
+
+          :event/ic-gate-pass
+          {:target :state/authorization-gate
+           :actions [:action/record-ic-gate-pass
+                     :action/check-both-gates-passed]}
+
+          :event/ic-gate-fail
+          {:target :state/aborting
+           :actions [:action/record-ic-gate-fail]}
+
+          :event/both-gates-passed
+          ;; Synthesized by :action/check-both-gates-passed when both
+          ;; gate-pass events have been recorded.
+          {:target :state/objection-window
+           :guards [(guard/objection-window-required)]}
+
+          :event/both-gates-passed
+          {:target :state/starting
+           :guards [(guard/objection-window-not-required)]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/objection-window
+  ;; Optional state. Entered if the address's policy requires a
+  ;; publish-then-execute pattern. Figure (or the IC) publishes
+  ;; intent-to-reshare and waits for the configured window. Holder
+  ;; can object (via a separate channel, application-layer) if they
+  ;; observe an unauthorized recovery attempt.
+  {:entry [:action/publish-recovery-intent
+           :action/start-objection-window-timer]
+   :on   {:event/objection-window-elapsed
+          {:target :state/starting}
+
+          :event/objection-raised
+          {:target :state/aborting
+           :actions [:action/record-objection]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/starting
+  ;; Send :ceremony/begin-reshare to all new-participants. Note that
+  ;; old participants who are NOT in new-participants (the lost
+  ;; holder) are NOT contacted; the protocol naturally tolerates
+  ;; their absence as long as surviving old participants meet the
+  ;; old threshold (which they do: Figure + IC = 2 ≥ old_threshold 2).
+  {:entry [:action/send-begin-reshare-to-new-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Same shape as keygen. Three parallel regions, one per
+  ;; new-participant.
+  {:on {:event/protocol-message-emit
+        {:target :state/running
+         :actions [:action/route-message]}
+
+        :event/ceremony-complete
+        {:target  :state/running
+         :actions [:action/record-party-done
+                   :action/check-all-parties-done]
+         :guards  [(guard/at-least-one-party-still-running)]}
+
+        :event/ceremony-complete
+        {:target  :state/finalizing
+         :actions [:action/record-party-done]
+         :guards  [(guard/all-parties-done-after-this-event)]}
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}
+
+   :statechart/parallel-regions
+   {:region/figure {:like :region/holder-template
+                    :substitute-actor :actor/figure}
+    :region/independent-custodian {:like :region/holder-template
+                                   :substitute-actor :actor/independent-custodian}
+    :region/new-holder {:like :region/holder-template
+                        :substitute-actor :actor/holder}}}
+
+  :state/finalizing
+  ;; Recovery-specific consistency check: every party's reported new
+  ;; public key must equal the ORIGINAL public key. This is the
+  ;; load-bearing UC2 invariant.
+  {:entry [:action/collect-per-party-results
+           :action/recovery-public-key-preservation-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target :state/aborting
+           :actions [:action/record-error]}}}
+
+  :state/complete
+  {:type :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-new-shareset-handles
+           :action/invalidate-old-holder-share-record
+           :action/append-to-audit-log]
+   :on   {}}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type :final
+   :entry [:action/notify-coordinator-failure
+           :action/append-to-audit-log]
+   :on   {}}}
+
+ :statechart/actions
+ {:action/load-address-policy
+  "Look up the wallet's policy in :state/address-policy-registry by
+   :ceremony/wallet-pk. Sets :ceremony/objection-window-required?
+   and acceptable-attestations list."
+
+  :action/extract-attestation-and-intent
+  "Pull :crypto/identity-attestation (or alternative) and
+   :crypto/recovery-intent from the begin-ceremony event payload
+   into context fields."
+
+  :action/dispatch-gate-verification-to-figure
+  "Send a gate-verification request to figure-bb carrying the
+   attestation and intent. figure-bb verifies signatures, freshness,
+   and policy match, then emits :event/figure-gate-pass or
+   :event/figure-gate-fail. Verification logic lives in figure-bb,
+   not in the orchestrator."
+
+  :action/dispatch-gate-verification-to-ic
+  "Same as above but to ic-bb. The IC performs verification
+   independently of Figure: it has its own copy of address policy
+   (or queries an independent source), verifies signatures against
+   its own copy of TAS public keys, etc. The independence is the
+   point."
+
+  :action/record-figure-gate-pass
+  "Set :ceremony/figure-gate-status to :gate-status/passed."
+
+  :action/record-figure-gate-fail
+  "Set :ceremony/figure-gate-status to :gate-status/rejected;
+   capture the rejection reason in :ceremony/error."
+
+  :action/record-ic-gate-pass
+  "Set :ceremony/ic-gate-status to :gate-status/passed."
+
+  :action/record-ic-gate-fail
+  "Set :ceremony/ic-gate-status to :gate-status/rejected;
+   capture the rejection reason in :ceremony/error."
+
+  :action/check-both-gates-passed
+  "If both :ceremony/figure-gate-status and :ceremony/ic-gate-status
+   are :gate-status/passed, fire :event/both-gates-passed."
+
+  :action/publish-recovery-intent
+  "Append a 'recovery pending' record to :state/audit-log
+   (Figure-side) and :state/ic-attestation-mirror (IC-side). This
+   makes the in-flight ceremony visible to anyone with read access
+   to those logs, including the original holder if they are
+   monitoring."
+
+  :action/start-objection-window-timer
+  "Arm a timer for the objection-window duration. When it fires,
+   emits :event/objection-window-elapsed."
+
+  :action/record-objection
+  "Capture the objection's source and reason. Sets
+   :ceremony/error to :reason/objection-raised."
+
+  :action/send-begin-reshare-to-new-participants
+  "Emit :ceremony/begin-reshare to each member of
+   :ceremony/new-participants. Each begin message includes:
+   - the actor's role
+   - :ceremony/old-participants and :ceremony/new-participants lists
+   - :ceremony/old-threshold and :ceremony/new-threshold
+   - :ceremony/wallet-pk (continuity anchor)
+   - the actor's :ceremony/old-handle if they had a previous share,
+     or :none for new participants like new_holder.
+   Old participants in old-participants but NOT in new-participants
+   (the lost holder) are not contacted."
+
+  :action/recovery-public-key-preservation-check
+  "Recovery-specific finalization. For each party in
+   :ceremony/results, assert that their reported new public key
+   equals :ceremony/wallet-pk. If any disagreement, fire
+   :event/finalization-failed with reason
+   :reason/public-key-drift. This is the load-bearing UC2 invariant."
+
+  :action/persist-new-shareset-handles
+  "Store the per-party new-share handles such that subsequent sign
+   ceremonies can reference them. Each handle remains opaque to the
+   orchestrator."
+
+  :action/invalidate-old-holder-share-record
+  "Mark the OLD holder's share handle in
+   :state/address-policy-registry as invalidated. The actual share
+   material is at the lost holder's storage, which is presumed
+   unrecoverable; this action records that the handle should not be
+   accepted in future ceremonies. Important for replay protection
+   and audit trail."
+
+  :action/append-to-audit-log
+  "Add an entry to :state/audit-log: ceremony id, attestations
+   verified, intent verified, ceremony participants, outcome.
+   Mirror to :state/ic-attestation-mirror as well."}
+
+ :statechart/guards
+ {:guard/objection-window-required
+  "True iff :ceremony/objection-window-required? in context is true."
+
+  :guard/objection-window-not-required
+  "True iff :ceremony/objection-window-required? in context is false."
+
+  :guard/at-least-one-party-still-running
+  "Same as keygen template."
+
+  :guard/all-parties-done-after-this-event
+  "Same as keygen template."}
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/authorization-gate
+                          :state/objection-window :state/starting
+                          :state/running :state/finalizing]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes "Cancel can come from the holder (calling off
+                         the recovery), from a coordinator timeout,
+                         or from an objection raised during the
+                         objection window."}
+
+  {:cross-cutting/name :deadline-elapsed
+   :cross-cutting/states [:state/authorization-gate :state/objection-window
+                          :state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes "Wall-clock deadline applies to the whole
+                         ceremony, including the gate and objection
+                         window phases."}
+
+  {:cross-cutting/name :both-gates-required
+   :cross-cutting/notes "The ceremony cannot leave
+                         :state/authorization-gate via a 'partial'
+                         pass. Either both gates pass (transition
+                         forward) or one rejects (transition to
+                         abort). There is no asymmetric outcome
+                         where one party participates without the
+                         other's consent."}]
+
+ :statechart/properties
+ [{:property/name :independent-gate-verification
+   :property/check "Both :action/dispatch-gate-verification-to-figure
+                    and :action/dispatch-gate-verification-to-ic must
+                    occur on entry to :state/authorization-gate.
+                    Each verification is independent: figure-bb's
+                    pass does not imply ic-bb will pass, and vice
+                    versa."}
+
+  {:property/name :public-key-preservation-mandatory
+   :property/check ":state/complete must be reachable only via
+                    :state/finalizing's
+                    :action/recovery-public-key-preservation-check
+                    succeeding. Any path that bypasses this check is
+                    a violation of the UC2 invariant."}
+
+  {:property/name :objection-window-respected
+   :property/check "If :ceremony/objection-window-required? is true,
+                    :state/starting must be reachable only via
+                    :state/objection-window (not directly from
+                    :state/authorization-gate)."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel."}
+
+  {:property/name :old-holder-not-contacted
+   :property/check ":action/send-begin-reshare-to-new-participants
+                    must dispatch only to actors in
+                    :ceremony/new-participants. The lost holder, who
+                    is in :ceremony/old-participants but not in
+                    :ceremony/new-participants, is not contacted.
+                    The protocol's tolerance for absent old
+                    participants makes this safe."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check "Same property as keygen and sign templates."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check "Same property as keygen and sign templates."}]}

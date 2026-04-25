@@ -1,0 +1,334 @@
+;; Statechart: Keygen ceremony
+;;
+;; Source: data-dictionary.edn :ceremony/keygen
+;;
+;; Models the orchestrator-side per-ceremony lifecycle of a keygen
+;; ceremony. Three share-holders (holder, Figure, IC) participate;
+;; orchestrator routes protocol messages between them. Outcome:
+;; three keygen outputs, all agreeing on a public key.
+;;
+;; This is the simplest non-trivial ceremony in the system. It has
+;; no input shares, no authorization gate, no member-change subtlety.
+;; Use it as the reference template for the orchestrator's ceremony-
+;; lifecycle pattern; the more complex ceremonies (sign, reshare-*)
+;; specialize this same template.
+;;
+;; --- statechart shape ---
+;; Hierarchical chart with parallel per-party substates within
+;; :running. Failure transitions out of :running drive to :aborting.
+;; All parties succeeding drives to :finalizing.
+;;
+;; Convention: [event] denotes a transition trigger;
+;;             {action} denotes an entry/exit action;
+;;             (guard) denotes a transition guard.
+
+{:statechart/id           :statechart/ceremony-keygen
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/keygen
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle"
+
+ :statechart/context
+ ;; Ceremony-instance state held alongside the statechart's state.
+ ;; In clj-statecharts terms, this is the extended state / context.
+ {:ceremony/id              :uuid              ; unique ceremony identifier
+  :ceremony/participants    [:actor/holder
+                             :actor/figure
+                             :actor/independent-custodian]
+  :ceremony/coordinator     :actor/figure      ; could be :actor/holder for holder-initiated
+  :ceremony/threshold       2
+  :ceremony/scheme          :scheme/ot-based-ecdsa-secp256k1
+  :ceremony/deadline        :timestamp         ; from :state/ceremony-deadlines
+  :ceremony/per-party-state {:actor/holder              :party-state/awaiting
+                             :actor/figure              :party-state/awaiting
+                             :actor/independent-custodian :party-state/awaiting}
+  :ceremony/results         {}                 ; party -> :crypto/wallet-keygen-output handle
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  ;; Ceremony record exists; no parties contacted yet.
+  {:on {:event/begin-ceremony
+        {:target :state/starting
+         :actions [:action/record-deadline]}
+
+        :event/cancel
+        {:target :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  ;; Send :ceremony/begin-keygen to all participants. Wait for first
+  ;; protocol message OR all parties to acknowledge readiness.
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Parallel region: each participant has its own party-substate.
+  ;; Routing of protocol messages is the dominant activity here;
+  ;; transitions within :running represent message flow.
+  ;;
+  ;; The orchestrator inspects :ceremony/per-party-state on every
+  ;; transition to determine if the ceremony has aggregate-level
+  ;; progress (all done -> finalizing, any errored -> aborting).
+  {:on {:event/protocol-message-emit
+        ;; Stay in :running, route the message.
+        {:target :state/running
+         :actions [:action/route-message]}
+
+        :event/ceremony-complete
+        ;; A party reports its share of the work is done.
+        {:target  :state/running ; or :state/finalizing if last party
+         :actions [:action/record-party-done
+                   :action/check-all-parties-done]
+         :guards  [(guard/at-least-one-party-still-running)]}
+
+        :event/ceremony-complete
+        ;; Last party reports done: transition to finalizing.
+        {:target  :state/finalizing
+         :actions [:action/record-party-done]
+         :guards  [(guard/all-parties-done-after-this-event)]}
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}
+
+   ;; Per-party substates. Each party progresses through these
+   ;; independently, driven by message and event traffic. The
+   ;; aggregate :running state guards above synthesize the per-party
+   ;; states into ceremony-wide transitions.
+   :statechart/parallel-regions
+   {:region/holder
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/holder)]}}}
+
+               :party-state/relaying
+               ;; Transient; immediately back to awaiting after action.
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done
+               ;; Terminal substate within :running.
+               {}
+
+               :party-state/errored
+               ;; Terminal substate within :running.
+               {}}}
+
+    :region/figure {:like :region/holder
+                    :substitute-actor :actor/figure}
+    :region/independent-custodian {:like :region/holder
+                                   :substitute-actor :actor/independent-custodian}}}
+
+  :state/finalizing
+  ;; All parties report done. Apply ceremony-type-specific
+  ;; consistency checks.
+  {:entry [:action/collect-per-party-results
+           :action/keygen-consistency-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          ;; Public keys disagreed, or some party returned malformed
+          ;; data. Transition to aborting.
+          {:target :state/aborting
+           :actions [:action/record-error]}}}
+
+  :state/complete
+  ;; FINAL state on success.
+  {:type :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles]
+   :on   {}}
+
+  :state/aborting
+  ;; Some party errored, or cancel/timeout received. Notify all
+  ;; remaining parties to stop, then transition to :failed.
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  ;; FINAL state on failure.
+  {:type :final
+   :entry [:action/notify-coordinator-failure]
+   :on   {}}}
+
+ ;; --- Action and guard descriptions ---
+ ;; Actions and guards are listed here as data, so a CC implementation
+ ;; can map them to functions. Keeping them declarative rather than
+ ;; embedding code is intentional: it lets a Clojure implementation
+ ;; substitute its own action functions while preserving the chart.
+
+ :statechart/actions
+ {:action/record-deadline
+  "Compute and store the wall-clock deadline based on ceremony type
+   and config. For keygen, default deadline is e.g. 60 seconds."
+
+  :action/send-begin-to-all-participants
+  "Emit :ceremony/begin-keygen to each :ceremony/participant via the
+   orchestrator's connection map. Each begin message includes the
+   participant's role, the peer list, and the threshold."
+
+  :action/start-deadline-timer
+  "Arm a timer that fires :event/deadline-elapsed when the deadline
+   is reached."
+
+  :action/route-message
+  "Look up the recipient (or 'all' for broadcast) in the routing
+   table; deliver the protocol body via :protocol/deliver."
+
+  :action/record-party-done
+  "Update :ceremony/per-party-state for the originating party to
+   :party-state/done; record the party's reported result handle in
+   :ceremony/results."
+
+  :action/check-all-parties-done
+  "Inspect :ceremony/per-party-state; if all parties are
+   :party-state/done, fire :event/finalization-needed (handled by the
+   guard arrangement at the :running level)."
+
+  :action/collect-per-party-results
+  "Aggregate :ceremony/results into a coherent ceremony-wide result
+   structure."
+
+  :action/keygen-consistency-check
+  "Ceremony-type-specific. For keygen: assert all parties' reported
+   public keys are equal. If yes, fire :event/finalization-passed.
+   If no, fire :event/finalization-failed with reason
+   :reason/public-key-disagreement."
+
+  :action/notify-coordinator-success
+  "Resolve the REPL caller's promise with the ceremony result."
+
+  :action/persist-result-handles
+  "Store the per-party result handles where subsequent ceremonies can
+   reference them. Handles are opaque to the orchestrator (they index
+   into the parties' own share stores)."
+
+  :action/send-cancel-to-all-participants
+  "Emit :ceremony/cancel to each participant. Reason is taken from
+   the ceremony context."
+
+  :action/start-abort-timeout
+  "Short timeout for parties to acknowledge the cancel; after this,
+   transition to :failed regardless of acks."
+
+  :action/record-error
+  "Capture the error reason in :ceremony/error context field."
+
+  :action/record-erroring-party
+  "Capture which party reported the error. Useful for forensics and
+   for choosing fallback actors in retry logic."
+
+  :action/record-cancel-reason
+  "Capture cancel reason: :reason/user-abort, :reason/timeout,
+   :reason/protocol-violation, etc."
+
+  :action/record-timeout
+  "Capture :reason/timeout in the error field."
+
+  :action/notify-coordinator-failure
+  "Resolve the REPL caller's promise with the ceremony failure
+   record. Includes :ceremony/error and any forensic context."}
+
+ :statechart/guards
+ {:guard/at-least-one-party-still-running
+  "True iff fewer than (count :ceremony/participants) parties are
+   currently in :party-state/done."
+
+  :guard/all-parties-done-after-this-event
+  "True iff all but exactly one party is currently in :party-state/done
+   and the firing event is the last party's :event/ceremony-complete.
+   Used to pick the right transition when :event/ceremony-complete
+   could fire from any party."
+
+  :guard/originated-from
+  "True iff the firing event was emitted by the named actor.
+   Parameter: :actor/* keyword."}
+
+ ;; --- Cross-cutting transitions worth being explicit about ---
+ ;; These are transitions that exist in multiple states and are easy
+ ;; to miss in a state-by-state reading.
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/starting :state/running
+                          :state/finalizing]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes "Cancel is legal from every non-final state.
+                         :state/aborting itself does not handle cancel
+                         (already aborting)."}
+
+  {:cross-cutting/name :deadline-elapsed-from-any-non-final-state
+   :cross-cutting/states [:state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes "Wall-clock deadline expiry causes abort from
+                         any state where the timer is running."}
+
+  {:cross-cutting/name :late-protocol-message-after-final
+   :cross-cutting/states [:state/complete :state/failed]
+   :cross-cutting/event :event/protocol-message-emit
+   :cross-cutting/action :action/log-and-drop
+   :cross-cutting/notes "Late-arriving messages from a party that
+                         hasn't yet seen the cancel are normal and
+                         should not corrupt orchestrator state."}]
+
+ ;; --- Properties that should hold on this chart ---
+ ;; Inspectable as static properties of the chart; useful for
+ ;; checking conformance of an implementation against the spec.
+
+ :statechart/properties
+ [{:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel (directly or via cross-cutting)."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete must be reachable only from
+                    :state/finalizing (no direct path from :running
+                    to :complete bypasses consistency checks)."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check ":state/failed must be reachable only from
+                    :state/aborting (no direct path from running
+                    states to :failed bypasses cleanup)."}
+
+  {:property/name :starting-bounded
+   :property/check ":state/starting must have a deadline-driven
+                    transition to :aborting; it must not be a
+                    hold-forever state."}]}

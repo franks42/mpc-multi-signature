@@ -1,0 +1,306 @@
+;; Statechart: Routine sign ceremony
+;;
+;; Source: data-dictionary.edn :ceremony/sign
+;;
+;; Models the orchestrator-side per-ceremony lifecycle of a routine
+;; sign ceremony. Two share-holders (holder, Figure) participate;
+;; IC is offline and not involved. Outcome: a single ECDSA signature
+;; valid under the wallet's public key.
+;;
+;; This chart specializes the keygen template (statechart-keygen.edn)
+;; with a few changes:
+;;
+;;   - Participant set is 2, not 3. The IC's per-party substate is
+;;     simply absent. This is the operational asymmetry (see the
+;;     architecture doc's "At the operational layer, the IC is held
+;;     in reserve" section) made structural in the chart.
+;;
+;;   - Triggered by a sign-request from the holder, not by REPL-driven
+;;     ceremony invocation. The orchestrator (or in production, the
+;;     coordinator role at Figure) receives the request and creates
+;;     the ceremony.
+;;
+;;   - Figure may refuse to participate based on issuer policy. This
+;;     introduces a new pre-running state (:state/policy-check) that
+;;     can transition to :state/aborting before any cryptographic
+;;     work begins.
+;;
+;;   - Inputs include a presignature (consumed) in addition to keygen
+;;     output. Inputs are checked at policy-check time.
+;;
+;;   - Finalization checks that the produced signature verifies
+;;     against the wallet's public key.
+
+{:statechart/id           :statechart/ceremony-sign
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/sign
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle"
+ :statechart/template     :statechart/ceremony-keygen ; specializes this template
+
+ :statechart/context
+ {:ceremony/id              :uuid
+  :ceremony/participants    [:actor/holder :actor/figure]
+  :ceremony/coordinator     :actor/figure
+  :ceremony/threshold       2
+  :ceremony/scheme          :scheme/ot-based-ecdsa-secp256k1
+  :ceremony/deadline        :timestamp
+  :ceremony/sign-request    nil ; :crypto/sign-request, set on receipt
+  :ceremony/wallet-pk       nil ; :crypto/wallet-public-key for verification
+  :ceremony/presign-handle  nil ; reference into :state/*-presign-stockpile
+  :ceremony/per-party-state {:actor/holder :party-state/awaiting
+                             :actor/figure :party-state/awaiting}
+  :ceremony/results         {} ; coordinator -> :crypto/transaction-signature
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  ;; Awaiting a sign request from the holder. Distinct from keygen's
+  ;; :state/pending because here we wait for the request, not for an
+  ;; explicit "begin" command.
+  {:on {:event/sign-request-received
+        {:target :state/policy-check
+         :actions [:action/record-sign-request]}
+
+        :event/cancel
+        {:target :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/policy-check
+  ;; Figure (or the coordinator role) applies issuer policy to the
+  ;; sign request. This is a synchronous check; either the policy
+  ;; allows the ceremony to proceed or it does not.
+  ;;
+  ;; This state is specific to sign ceremonies and does not exist in
+  ;; the keygen template. Other ceremonies that have authorization
+  ;; gates (recovery, divorce) have their own analogous gating state.
+  {:entry [:action/run-issuer-policy-check]
+   :on   {:event/policy-pass
+          {:target :state/starting
+           :actions [:action/select-presignature]}
+
+          :event/policy-fail
+          {:target :state/failed
+           :actions [:action/record-policy-rejection]}
+
+          :event/cancel
+          {:target :state/failed
+           :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  ;; Send :ceremony/begin-sign to holder and Figure. Wait for first
+  ;; protocol message from the participants.
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Identical structure to keygen's :state/running, with two parallel
+  ;; regions instead of three.
+  {:on {:event/protocol-message-emit
+        {:target :state/running
+         :actions [:action/route-message]}
+
+        :event/ceremony-complete
+        {:target  :state/running
+         :actions [:action/record-party-done
+                   :action/check-all-parties-done]
+         :guards  [(guard/at-least-one-party-still-running)]}
+
+        :event/ceremony-complete
+        {:target  :state/finalizing
+         :actions [:action/record-party-done]
+         :guards  [(guard/all-parties-done-after-this-event)]}
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}
+
+   :statechart/parallel-regions
+   {:region/holder
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/holder)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/figure {:like :region/holder
+                    :substitute-actor :actor/figure}}}
+
+  :state/finalizing
+  ;; Sign-specific consistency check: the coordinator's reported
+  ;; signature must verify against :ceremony/wallet-pk.
+  {:entry [:action/collect-per-party-results
+           :action/sign-consistency-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          ;; Signature did not verify, or coordinator returned no
+          ;; signature.
+          {:target :state/aborting
+           :actions [:action/record-error]}}}
+
+  :state/complete
+  {:type :final
+   :entry [:action/notify-coordinator-success
+           :action/release-presignature ; mark as consumed
+           :action/append-to-audit-log]
+   :on   {}}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type :final
+   :entry [:action/notify-coordinator-failure
+           :action/append-to-audit-log]
+   :on   {}}}
+
+ ;; Actions specific to sign ceremonies. The actions inherited from
+ ;; the keygen template (route-message, record-party-done, etc.) are
+ ;; not duplicated here. CC implementations should treat the chart
+ ;; template hierarchy as inheritance: this chart adds and overrides;
+ ;; everything else is inherited.
+
+ :statechart/actions
+ {:action/record-sign-request
+  "Capture the :crypto/sign-request payload in
+   :ceremony/sign-request context field. Capture
+   :ceremony/wallet-pk by looking up the request's wallet identifier
+   in :state/address-policy-registry."
+
+  :action/run-issuer-policy-check
+  "Apply Figure's issuer policy to the sign request. May involve
+   transaction-content inspection, daily-limit checks, blocklist
+   checks, etc. Synchronous; emits :event/policy-pass or
+   :event/policy-fail. Implementation lives in figure-bb's policy
+   module, not in the orchestrator."
+
+  :action/record-policy-rejection
+  "Capture the policy rejection reason in :ceremony/error.
+   Distinguishes 'Figure refused' from 'protocol failed' for audit
+   purposes."
+
+  :action/select-presignature
+  "Pick an available presignature from
+   :state/figure-presign-stockpile (and verify the matching
+   counterpart exists in :state/holder-presign-stockpile). Mark it
+   provisionally as in-use so a concurrent ceremony cannot consume
+   the same one. Set :ceremony/presign-handle in context."
+
+  :action/sign-consistency-check
+  "Sign-specific finalization. Read the coordinator's reported
+   signature from :ceremony/results; verify against
+   :ceremony/wallet-pk using standard k256 ECDSA verification. If
+   verification passes, fire :event/finalization-passed; otherwise
+   :event/finalization-failed with reason
+   :reason/signature-verification-failure."
+
+  :action/release-presignature
+  "Mark :ceremony/presign-handle as consumed. The presignature is
+   now spent; no other ceremony can use it. Removes from stockpile
+   atomically."
+
+  :action/append-to-audit-log
+  "Add an entry to :state/audit-log recording: ceremony id,
+   timestamp, sign-request hash, signature (or failure reason),
+   policy-check outcome."}
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/policy-check
+                          :state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting-or-failed
+   :cross-cutting/notes "From :pending or :policy-check (no protocol
+                         work has started), cancel goes directly to
+                         :failed. From :starting onward, cancel goes
+                         to :aborting first to inform parties."}
+
+  {:cross-cutting/name :deadline-elapsed
+   :cross-cutting/states [:state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes "Deadline timer is armed at :state/starting
+                         and disarmed at :state/finalizing entry."}
+
+  {:cross-cutting/name :no-IC-events
+   :cross-cutting/notes "The IC is not a participant. Any event
+                         claiming origin :actor/independent-custodian
+                         in this ceremony is a protocol violation
+                         and should be logged and ignored, not
+                         routed."}]
+
+ :statechart/properties
+ [{:property/name :IC-not-participant
+   :property/check "No :ceremony/participants entry includes
+                    :actor/independent-custodian. The IC is offline
+                    by design for routine signing."}
+
+  {:property/name :presignature-consumed-iff-complete
+   :property/check ":action/release-presignature must be invoked on
+                    entry to :state/complete (consumed) but NOT on
+                    entry to :state/failed (not consumed; can be
+                    reused for a retry). This preserves the
+                    one-time-use property without wasting
+                    presignatures on transient failures."}
+
+  {:property/name :policy-check-precedes-protocol-work
+   :property/check "No protocol message is sent to participants
+                    before :state/policy-check has passed. This
+                    prevents the holder's MPC share from being
+                    exercised for transactions Figure would refuse."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete must be reachable only from
+                    :state/finalizing."}
+
+  {:property/name :sign-only-with-fresh-presignature
+   :property/check ":action/select-presignature must mark the
+                    presignature as in-use atomically; concurrent
+                    sign ceremonies must not be able to claim the
+                    same presignature."}]}

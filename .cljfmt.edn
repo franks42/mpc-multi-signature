@@ -1,0 +1,3 @@
+{:remove-surrounding-whitespace? true
+ :remove-trailing-whitespace?    true
+ :insert-missing-whitespace?     true}

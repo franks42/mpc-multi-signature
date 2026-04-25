@@ -1,0 +1,1030 @@
+;; YLDS Recovery System: Data Dictionary
+;;
+;; This file is the canonical naming and structural reference for the
+;; YLDS recovery system. Every named entity in the design has an entry
+;; here. Statecharts, EDN message vocabulary, and implementation code
+;; reference these entries by their namespaced keyword identifiers.
+;;
+;; Layout: five top-level sections, one per layer.
+;;
+;;   1. :actors           -- the named parties and services
+;;   2. :crypto-entities  -- keys, shares, signatures, attestations
+;;   3. :wallet-state     -- persistent state at each party
+;;   4. :ceremonies       -- the protocol invocations
+;;   5. :events           -- abstract events that drive statechart transitions
+;;
+;; Each entry uses a consistent shape:
+;;   :id            -- namespaced keyword, the canonical identifier
+;;   :name          -- human-readable name
+;;   :description   -- 1-3 sentence prose explanation
+;;   ...layer-specific keys, see each section
+;;
+;; Cross-references between sections use :id keywords. For example, an
+;; attestation entity references its :issued-by as :actor/kyc-tas.
+;;
+;; Convention: keywords in this dictionary are always namespaced.
+;; Top-level namespaces:
+;;   :actor/...           an actor entity
+;;   :crypto/...          a cryptographic entity
+;;   :state/...           a wallet-state entity
+;;   :ceremony/...        a ceremony entity
+;;   :event/...           an event
+;;   :role/...            a role classification
+;;   :phase/...           a phase classification (within ceremonies)
+;;
+;; Bare-form aliases: in EDN message vocabularies, REPL examples, and
+;; implementation code, bare forms (:holder, :figure, :ic, :sign,
+;; :commitment-registry, etc.) are used where context makes the
+;; entity kind unambiguous. Bare form and namespaced form denote the
+;; same entity; the choice between them is stylistic. The dictionary
+;; uses namespaced form throughout because it catalogs heterogeneous
+;; kinds together and namespacing prevents collision.
+;;
+;; Convention for bare forms: drop the namespace prefix and use the
+;; entity's terminal segment. :actor/independent-custodian -> :ic
+;; (using the :short-name field where one is defined, otherwise the
+;; full terminal segment).
+
+{:dictionary/version "0.1.0"
+ :dictionary/status :draft
+ :dictionary/scope "YLDS recovery system, exploration harness through Stage 5"
+
+ ;; ============================================================
+ ;; LAYER 1: ACTORS
+ ;; ============================================================
+ ;;
+ ;; Each actor entry includes:
+ ;;   :role            -- :role/share-holder, :role/attestation-service,
+ ;;                       :role/end-user, :role/coordinator
+ ;;   :authority       -- what this actor can decide (text)
+ ;;   :availability    -- :availability/always-online, :availability/on-demand,
+ ;;                       :availability/reserved
+ ;;   :holds-share?    -- boolean: does this actor hold an MPC share
+ ;;   :hosts           -- collection of :state/* entities this actor stores
+ ;;   :issues          -- collection of :crypto/* entities this actor produces
+ ;;   :verifies        -- collection of :crypto/* entities this actor validates
+ ;;
+ :actors
+ {:actor/holder
+  {:id :actor/holder
+   :name "Holder"
+   :description "The end user who owns the wallet. Initiates routine
+                 transactions, registers attestation policy at wallet
+                 setup, signs recovery intent during recovery
+                 ceremonies."
+   :role :role/end-user
+   :authority "May initiate any ceremony for their own wallet. Cannot
+               unilaterally produce signatures (requires threshold)."
+   :availability :availability/on-demand ; online when transacting
+   :holds-share? true
+   :hosts [:state/holder-share-store
+           :state/recovery-key
+           :state/attestation-credentials]
+   :issues [:crypto/recovery-intent
+            :crypto/sign-request]
+   :verifies [:crypto/transaction-signature]}
+
+  :actor/figure
+  {:id :actor/figure
+   :name "Figure"
+   :description "The issuer-affiliated co-signer. Holds an MPC share,
+                 enforces issuer policy for transactions, maintains
+                 the address-to-attestation-policy registry, verifies
+                 attestations during structural ceremonies. Always
+                 online for routine signing."
+   :role :role/share-holder
+   :authority "May refuse to participate in any signing ceremony based
+               on issuer policy. May refuse to participate in
+               structural ceremonies if attestation gate is not
+               satisfied. Cannot unilaterally sign or unilaterally
+               authorize structural changes."
+   :availability :availability/always-online
+   :holds-share? true
+   :hosts [:state/figure-share-store
+           :state/address-policy-registry
+           :state/audit-log
+           :state/objection-window-state]
+   :issues []
+   :verifies [:crypto/attestation
+              :crypto/recovery-intent
+              :crypto/divorce-intent]}
+
+  :actor/independent-custodian
+  {:id :actor/independent-custodian
+   :name "Independent Custodian"
+   :short-name "IC"
+   :description "Independent share-holder, not affiliated with Figure.
+                 Held in reserve: online only for ceremonies that
+                 change wallet structure (recovery, divorce, refresh).
+                 Offline during all routine signing. Independently
+                 verifies attestations during structural ceremonies."
+   :role :role/share-holder
+   :authority "May refuse to participate in any structural ceremony
+               based on its own attestation verification. Independence
+               from Figure is the load-bearing trust property; the IC
+               does not delegate verification to Figure."
+   :availability :availability/reserved
+   :holds-share? true
+   :hosts [:state/ic-share-store
+           :state/ic-attestation-mirror]
+   :issues []
+   :verifies [:crypto/attestation
+              :crypto/recovery-intent
+              :crypto/divorce-intent]}
+
+  :actor/kyc-tas
+  {:id :actor/kyc-tas
+   :name "KYC Trusted Attestation Service"
+   :description "Identity-verifying attestation service. Authenticates
+                 a person via KYC at attestation time, produces a
+                 signed attestation binding identity to public key.
+                 Outsourced; multiple instances possible."
+   :role :role/attestation-service
+   :authority "Issues attestations attesting to identity. Has no
+               authority over any wallet directly; share-holders
+               choose to honor attestations from this service per
+               wallet policy."
+   :availability :availability/on-demand
+   :holds-share? false
+   :hosts [:state/tas-signing-key
+           :state/tas-attestation-log]
+   :issues [:crypto/identity-attestation]
+   :verifies []}
+
+  :actor/commitment-tas
+  {:id :actor/commitment-tas
+   :name "Commitment Trusted Attestation Service"
+   :description "Verifies that a holder revealed a secret matching a
+                 previously-registered commitment for a public key.
+                 Produces a signed attestation. Outsourced from
+                 Figure; may run independent on-chain anchoring of
+                 commitment hashes for verifiability."
+   :role :role/attestation-service
+   :authority "Issues attestations attesting to commitment-secret
+               correctness. Has no authority over any wallet directly."
+   :availability :availability/on-demand
+   :holds-share? false
+   :hosts [:state/tas-signing-key
+           :state/commitment-registry]
+   :issues [:crypto/commitment-attestation]
+   :verifies [:crypto/commitment-secret]}
+
+  :actor/social-recovery-tas
+  {:id :actor/social-recovery-tas
+   :name "Social Recovery Trusted Attestation Service"
+   :description "Coordinates recovery contacts (k-of-n pre-designated
+                 trusted parties). Produces an attestation when k of
+                 n contacts confirm the holder is requesting recovery.
+                 Optional alternative to KYC and commitment paths."
+   :role :role/attestation-service
+   :authority "Issues attestations attesting to social-recovery
+               consensus. Has no authority over any wallet directly."
+   :availability :availability/on-demand
+   :holds-share? false
+   :hosts [:state/tas-signing-key
+           :state/recovery-contacts-registry]
+   :issues [:crypto/social-recovery-attestation]
+   :verifies []}
+
+  :actor/orchestrator
+  {:id :actor/orchestrator
+   :name "Orchestrator"
+   :description "Harness-only fourth role. Drives ceremonies from a
+                 REPL, routes EDN messages between parties, enforces
+                 timeouts. Has no production analog: in production,
+                 ceremony coordination distributes across the parties
+                 with one party serving as :role/coordinator per
+                 ceremony."
+   :role :role/coordinator
+   :authority "May cancel ceremonies, enforce timeouts. Holds no
+               cryptographic material. Replaceable by a different
+               coordinator implementation without affecting parties."
+   :availability :availability/always-online
+   :holds-share? false
+   :scope :scope/exploration-harness-only
+   :hosts [:state/ceremony-routing-table
+           :state/ceremony-deadlines]
+   :issues []
+   :verifies []}
+
+  :actor/ceremony-coordinator
+  {:id :actor/ceremony-coordinator
+   :name "Ceremony Coordinator"
+   :description "Production analog of :actor/orchestrator. A transient
+                 role one of the share-holders plays for the duration
+                 of a single ceremony. Typically Figure for issuer-
+                 policy operations; possibly the holder for
+                 routine signing they initiate; rotates by ceremony
+                 type and policy."
+   :role :role/coordinator
+   :authority "Per-ceremony only. Coordinates message routing for one
+               specific ceremony invocation; has no persistent
+               authority across ceremonies."
+   :availability :availability/per-ceremony
+   :holds-share? :inherits-from-host-actor
+   :scope :scope/production-only
+   :hosts [] ; transient role; persistent state lives at the host actor
+   :issues []
+   :verifies []}}
+
+ ;; ============================================================
+ ;; LAYER 2: CRYPTOGRAPHIC ENTITIES
+ ;; ============================================================
+ ;;
+ ;; Each crypto entry includes:
+ ;;   :kind          -- :kind/key-share, :kind/public-key, :kind/signature,
+ ;;                     :kind/attestation, :kind/secret, :kind/intent
+ ;;   :producer      -- :ceremony/* or :actor/* that produces it
+ ;;   :consumers     -- collection of :ceremony/* or :actor/* that use it
+ ;;   :lifetime      -- :lifetime/permanent, :lifetime/per-ceremony,
+ ;;                     :lifetime/freshness-windowed
+ ;;   :storage       -- :state/* entity (or :ephemeral)
+ ;;   :scheme        -- cryptographic scheme (where applicable)
+ ;;
+ :crypto-entities
+ {:crypto/wallet-keygen-output
+  {:id :crypto/wallet-keygen-output
+   :name "Wallet keygen output"
+   :description "The full keygen output (KeygenOutput in the
+                 threshold-signatures crate): public key plus the
+                 calling party's secret share. Each share-holder's
+                 keygen output is distinct; all agree on the public
+                 key component."
+   :kind :kind/key-share
+   :producer :ceremony/keygen
+   :consumers [:ceremony/sign :ceremony/reshare-recovery
+               :ceremony/reshare-divorce :ceremony/reshare-refresh]
+   :lifetime :lifetime/permanent
+   :storage [:state/holder-share-store :state/figure-share-store :state/ic-share-store]
+   :scheme :scheme/ot-based-ecdsa-secp256k1}
+
+  :crypto/wallet-public-key
+  {:id :crypto/wallet-public-key
+   :name "Wallet public key"
+   :description "The public key component of the wallet's keygen
+                 output. Visible to all parties; serves as the wallet's
+                 on-chain identity. Preserved across recovery, divorce,
+                 and refresh ceremonies."
+   :kind :kind/public-key
+   :producer :ceremony/keygen
+   :consumers [:ceremony/sign :ceremony/reshare-recovery
+               :ceremony/reshare-divorce :ceremony/reshare-refresh
+               :actor/figure :actor/independent-custodian]
+   :lifetime :lifetime/permanent
+   :storage [:state/address-policy-registry] ; the canonical record
+   :scheme :scheme/ot-based-ecdsa-secp256k1}
+
+  :crypto/triple-share
+  {:id :crypto/triple-share
+   :name "Beaver triple share"
+   :description "One party's share of a Beaver multiplication triple
+                 used by OT-based ECDSA presigning. Generated in
+                 advance by any subset of share-holders meeting the
+                 threshold. One-time-use: each triple authorizes
+                 exactly one presignature."
+   :kind :kind/key-share
+   :producer :ceremony/triple-generation
+   :consumers [:ceremony/presign]
+   :lifetime :lifetime/per-ceremony ; consumed by presign
+   :storage [:state/holder-triple-stockpile :state/figure-triple-stockpile]
+   :scheme :scheme/ot-based-ecdsa-secp256k1}
+
+  :crypto/presignature
+  {:id :crypto/presignature
+   :name "Presignature"
+   :description "Pre-computed signing material from a presign ceremony.
+                 Consumes triples; produces a presignature usable for
+                 one signature with a fresh message. One-time-use."
+   :kind :kind/key-share
+   :producer :ceremony/presign
+   :consumers [:ceremony/sign]
+   :lifetime :lifetime/per-ceremony
+   :storage [:state/holder-presign-stockpile :state/figure-presign-stockpile]
+   :scheme :scheme/ot-based-ecdsa-secp256k1}
+
+  :crypto/transaction-signature
+  {:id :crypto/transaction-signature
+   :name "Transaction signature"
+   :description "An ECDSA signature on a transaction message hash,
+                 valid under the wallet's public key. Produced by a
+                 sign ceremony; verifiable by any standard ECDSA
+                 verifier."
+   :kind :kind/signature
+   :producer :ceremony/sign
+   :consumers [] ; consumed by external systems (the chain)
+   :lifetime :lifetime/permanent
+   :scheme :scheme/ot-based-ecdsa-secp256k1}
+
+  :crypto/identity-attestation
+  {:id :crypto/identity-attestation
+   :name "Identity attestation"
+   :description "Signed assertion from a KYC TAS that an authenticated
+                 identity is associated with a public key. Used as an
+                 authorization gate input for structural ceremonies.
+                 Has freshness window."
+   :kind :kind/attestation
+   :producer :actor/kyc-tas
+   :consumers [:actor/figure :actor/independent-custodian
+               :ceremony/reshare-recovery :ceremony/reshare-divorce]
+   :lifetime :lifetime/freshness-windowed
+   :storage :ephemeral
+   :scheme :scheme/ed25519 ; assumed; TAS signing key choice tbd
+   :payload {:authenticated-identity :string
+             :public-key :crypto/wallet-public-key
+             :issuance-timestamp :timestamp
+             :expiration-timestamp :timestamp
+             :tas-id :keyword}}
+
+  :crypto/commitment-attestation
+  {:id :crypto/commitment-attestation
+   :name "Commitment attestation"
+   :description "Signed assertion from a commitment TAS that a holder
+                 revealed a valid commitment secret for a public key.
+                 Alternative authorization path to identity
+                 attestation."
+   :kind :kind/attestation
+   :producer :actor/commitment-tas
+   :consumers [:actor/figure :actor/independent-custodian
+               :ceremony/reshare-recovery]
+   :lifetime :lifetime/freshness-windowed
+   :storage :ephemeral
+   :scheme :scheme/ed25519
+   :payload {:public-key :crypto/wallet-public-key
+             :commitment-id :string
+             :issuance-timestamp :timestamp
+             :expiration-timestamp :timestamp
+             :tas-id :keyword}}
+
+  :crypto/social-recovery-attestation
+  {:id :crypto/social-recovery-attestation
+   :name "Social recovery attestation"
+   :description "Signed assertion from a social recovery TAS that k of
+                 n pre-designated recovery contacts confirmed the
+                 holder is requesting recovery. Alternative
+                 authorization path."
+   :kind :kind/attestation
+   :producer :actor/social-recovery-tas
+   :consumers [:actor/figure :actor/independent-custodian
+               :ceremony/reshare-recovery]
+   :lifetime :lifetime/freshness-windowed
+   :storage :ephemeral
+   :scheme :scheme/ed25519}
+
+  :crypto/recovery-intent
+  {:id :crypto/recovery-intent
+   :name "Recovery intent statement"
+   :description "Holder-signed statement asserting recovery intent for
+                 a specific (old-public-key -> new-public-key)
+                 transition. Closes the audit-trail gap that
+                 attestations alone leave open: distinguishes 'holder
+                 was authenticated' from 'holder requested this
+                 specific recovery'."
+   :kind :kind/intent
+   :producer :actor/holder
+   :consumers [:actor/figure :actor/independent-custodian
+               :ceremony/reshare-recovery]
+   :lifetime :lifetime/freshness-windowed
+   :storage :ephemeral
+   :scheme :scheme/ecdsa-secp256k1 ; signed with :state/recovery-key
+   :payload {:old-public-key :crypto/wallet-public-key
+             :new-public-key :crypto/wallet-public-key
+             :timestamp :timestamp
+             :nonce :bytes}}
+
+  :crypto/divorce-intent
+  {:id :crypto/divorce-intent
+   :name "Divorce intent statement"
+   :description "Holder-signed statement asserting intent to remove
+                 Figure from the wallet, with optional replacement
+                 co-signer designated. Authorization gate for
+                 :ceremony/reshare-divorce."
+   :kind :kind/intent
+   :producer :actor/holder
+   :consumers [:actor/independent-custodian
+               :ceremony/reshare-divorce]
+   :lifetime :lifetime/freshness-windowed
+   :storage :ephemeral
+   :scheme :scheme/ecdsa-secp256k1
+   :payload {:wallet-public-key :crypto/wallet-public-key
+             :replacement-cosigner :keyword ; or :none for 2-of-2
+             :timestamp :timestamp}}
+
+  :crypto/sign-request
+  {:id :crypto/sign-request
+   :name "Sign request"
+   :description "Holder request to sign a transaction. Carries the
+                 transaction message hash and any policy-relevant
+                 metadata Figure needs to enforce issuer policy. Not
+                 cryptographically signed by holder for routine
+                 transactions; the cryptographic act of participating
+                 in the signing ceremony is the holder's
+                 authorization."
+   :kind :kind/intent
+   :producer :actor/holder
+   :consumers [:actor/figure :ceremony/sign]
+   :lifetime :lifetime/per-ceremony
+   :storage :ephemeral}
+
+  :crypto/commitment-secret
+  {:id :crypto/commitment-secret
+   :name "Commitment secret"
+   :description "Holder-held secret whose hash was registered as a
+                 commitment at wallet setup. Revealed at recovery time
+                 to a commitment TAS to obtain
+                 :crypto/commitment-attestation."
+   :kind :kind/secret
+   :producer :actor/holder ; generated at wallet setup
+   :consumers [:actor/commitment-tas]
+   :lifetime :lifetime/permanent
+   :storage [:state/recovery-key] ; or wherever the holder keeps it
+   :scheme :scheme/hash-commitment}}
+
+ ;; ============================================================
+ ;; LAYER 3: WALLET-STATE ENTITIES
+ ;; ============================================================
+ ;;
+ ;; Persistent state. Each entry includes:
+ ;;   :hosted-by     -- :actor/* that stores this state
+ ;;   :contains      -- collection of :crypto/* entities (or descriptions)
+ ;;   :persistence   -- :persistence/per-wallet, :persistence/per-actor,
+ ;;                     :persistence/per-ceremony
+ ;;   :access        -- :access/private, :access/queryable-by-others
+ ;;
+ :wallet-state
+ {:state/holder-share-store
+  {:id :state/holder-share-store
+   :name "Holder share store"
+   :description "Per-wallet storage of the holder's MPC share for each
+                 wallet they own. In exploration harness: plaintext
+                 file. In production: encrypted at rest, possibly
+                 hardware-backed."
+   :hosted-by :actor/holder
+   :contains [:crypto/wallet-keygen-output]
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/figure-share-store
+  {:id :state/figure-share-store
+   :name "Figure share store"
+   :description "Per-wallet storage of Figure's MPC share for every
+                 Figure-issued wallet. Production-grade key
+                 management is required."
+   :hosted-by :actor/figure
+   :contains [:crypto/wallet-keygen-output]
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/ic-share-store
+  {:id :state/ic-share-store
+   :name "IC share store"
+   :description "Per-wallet storage of the IC's MPC share. Held offline
+                 during routine signing; brought online only for
+                 structural ceremonies. Security profile is matched to
+                 reserve usage (cold storage, HSM, etc.)."
+   :hosted-by :actor/independent-custodian
+   :contains [:crypto/wallet-keygen-output]
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/holder-triple-stockpile
+  {:id :state/holder-triple-stockpile
+   :name "Holder triple stockpile"
+   :description "Pre-generated Beaver triple shares awaiting
+                 consumption by future presign ceremonies. Filled by
+                 :ceremony/triple-generation; drained by
+                 :ceremony/presign."
+   :hosted-by :actor/holder
+   :contains [:crypto/triple-share]
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/figure-triple-stockpile
+  {:id :state/figure-triple-stockpile
+   :name "Figure triple stockpile"
+   :description "Figure-side counterpart to :state/holder-triple-stockpile."
+   :hosted-by :actor/figure
+   :contains [:crypto/triple-share]
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/holder-presign-stockpile
+  {:id :state/holder-presign-stockpile
+   :name "Holder presign stockpile"
+   :description "Pre-computed presignatures awaiting consumption by
+                 future sign ceremonies. Optional optimization;
+                 alternative is to run presign synchronously with each
+                 sign request."
+   :hosted-by :actor/holder
+   :contains [:crypto/presignature]
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/figure-presign-stockpile
+  {:id :state/figure-presign-stockpile
+   :name "Figure presign stockpile"
+   :description "Figure-side counterpart to :state/holder-presign-stockpile."
+   :hosted-by :actor/figure
+   :contains [:crypto/presignature]
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/recovery-key
+  {:id :state/recovery-key
+   :name "Holder recovery key"
+   :description "Holder-held key used to sign :crypto/recovery-intent
+                 and :crypto/divorce-intent statements. Distinct from
+                 the wallet's MPC share (otherwise share loss would
+                 also lose recovery capability). Generated at wallet
+                 setup and registered with Figure as the recovery
+                 authorization key for that wallet."
+   :hosted-by :actor/holder
+   :contains [] ; opaque key; not a :crypto/* entity in dictionary terms
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/attestation-credentials
+  {:id :state/attestation-credentials
+   :name "Holder attestation credentials"
+   :description "Whatever the holder needs to obtain attestations from
+                 their registered attestation services. For KYC:
+                 identity documents. For commitment: the commitment
+                 secret. For social recovery: contact information for
+                 recovery contacts. Heterogeneous by attestation
+                 method."
+   :hosted-by :actor/holder
+   :contains [:crypto/commitment-secret]
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/address-policy-registry
+  {:id :state/address-policy-registry
+   :name "Address policy registry"
+   :description "Maps wallet public key -> attestation policy for that
+                 wallet. Records: which attestation services are
+                 acceptable for which kinds of structural ceremonies,
+                 holder recovery key for verifying intent statements,
+                 objection-window duration. Hosted by Figure as part
+                 of issuer-policy enforcement."
+   :hosted-by :actor/figure
+   :contains [] ; structural records, not cryptographic entities
+   :persistence :persistence/per-wallet
+   :access :access/queryable-by-others}
+
+  :state/audit-log
+  {:id :state/audit-log
+   :name "Audit log"
+   :description "Append-only record of structural ceremonies for each
+                 wallet: attestations received, intent statements
+                 received, ceremony participants, ceremony outcomes.
+                 Hosted by Figure; mirrored by IC for independence."
+   :hosted-by :actor/figure
+   :contains []
+   :persistence :persistence/per-wallet
+   :access :access/queryable-by-others}
+
+  :state/objection-window-state
+  {:id :state/objection-window-state
+   :name "Objection window state"
+   :description "Per-pending-ceremony record: when was the ceremony
+                 announced, when does the objection window close, has
+                 any objection been raised. Implements
+                 publish-then-execute pattern for high-impact
+                 structural ceremonies."
+   :hosted-by :actor/figure
+   :contains []
+   :persistence :persistence/per-ceremony
+   :access :access/queryable-by-others}
+
+  :state/ic-attestation-mirror
+  {:id :state/ic-attestation-mirror
+   :name "IC attestation mirror"
+   :description "IC-side independent record of attestations received
+                 for structural ceremonies. Independence guarantee:
+                 the IC verifies attestations against its own copy of
+                 the address-policy registry, not Figure's. Required
+                 for the divorce flow (where Figure is being removed
+                 and cannot be trusted to verify)."
+   :hosted-by :actor/independent-custodian
+   :contains []
+   :persistence :persistence/per-wallet
+   :access :access/private}
+
+  :state/tas-signing-key
+  {:id :state/tas-signing-key
+   :name "TAS signing key"
+   :description "Per-TAS persistent signing key used to issue
+                 attestations. Should itself be threshold-protected or
+                 HSM-backed for production deployment."
+   :hosted-by :role/attestation-service
+   :contains []
+   :persistence :persistence/per-actor
+   :access :access/private}
+
+  :state/tas-attestation-log
+  {:id :state/tas-attestation-log
+   :name "TAS attestation log"
+   :description "Per-TAS append-only record of attestations issued.
+                 Useful for revocation lists and forensic audit if a
+                 TAS is later determined to have been compromised."
+   :hosted-by :role/attestation-service
+   :contains [:crypto/identity-attestation
+              :crypto/commitment-attestation
+              :crypto/social-recovery-attestation]
+   :persistence :persistence/per-actor
+   :access :access/queryable-by-others}
+
+  :state/commitment-registry
+  {:id :state/commitment-registry
+   :name "Commitment registry"
+   :description "Hosted by :actor/commitment-tas. Maps commitment ID
+                 (or public key) to commitment hash registered at
+                 wallet setup. Optionally anchored on-chain (e.g., on
+                 Provenance) for tamper-evidence and independent
+                 verifiability."
+   :hosted-by :actor/commitment-tas
+   :contains []
+   :persistence :persistence/per-actor
+   :access :access/queryable-by-others}
+
+  :state/recovery-contacts-registry
+  {:id :state/recovery-contacts-registry
+   :name "Recovery contacts registry"
+   :description "Hosted by :actor/social-recovery-tas. Maps wallet
+                 public key to list of pre-designated recovery
+                 contacts and the k-of-n threshold required."
+   :hosted-by :actor/social-recovery-tas
+   :contains []
+   :persistence :persistence/per-actor
+   :access :access/private}
+
+  :state/ceremony-routing-table
+  {:id :state/ceremony-routing-table
+   :name "Ceremony routing table"
+   :description "Orchestrator-side per-ceremony record: participant ->
+                 connection mapping for routing protocol messages.
+                 Harness-only; production has no analog (parties
+                 establish point-to-point connections directly)."
+   :hosted-by :actor/orchestrator
+   :contains []
+   :persistence :persistence/per-ceremony
+   :access :access/private
+   :scope :scope/exploration-harness-only}
+
+  :state/ceremony-deadlines
+  {:id :state/ceremony-deadlines
+   :name "Ceremony deadlines"
+   :description "Orchestrator-side per-ceremony deadlines for timeout
+                 enforcement. Harness-only; in production each party
+                 enforces its own timeouts for ceremonies it
+                 participates in."
+   :hosted-by :actor/orchestrator
+   :contains []
+   :persistence :persistence/per-ceremony
+   :access :access/private
+   :scope :scope/exploration-harness-only}}
+
+ ;; ============================================================
+ ;; LAYER 4: CEREMONIES
+ ;; ============================================================
+ ;;
+ ;; Each ceremony entry includes:
+ ;;   :kind            -- :kind/cryptographic, :kind/policy,
+ ;;                       :kind/attestation
+ ;;   :participants    -- list of :actor/* (or :role/*) involved
+ ;;   :coordinator     -- which actor coordinates (or :variable)
+ ;;   :inputs          -- :crypto/* and :state/* entities consumed
+ ;;   :outputs         -- :crypto/* entities produced
+ ;;   :authorization   -- gate condition (text or refs to required attestations)
+ ;;   :scheme          -- cryptographic scheme used (where applicable)
+ ;;   :phases          -- ordered list of phases for multi-phase ceremonies
+ ;;
+ :ceremonies
+ {:ceremony/keygen
+  {:id :ceremony/keygen
+   :name "Keygen ceremony"
+   :description "Initial wallet setup. All three share-holders run a
+                 distributed key generation protocol; each ends with a
+                 share of a fresh public key. Public key is registered
+                 in :state/address-policy-registry along with
+                 attestation policy."
+   :kind :kind/cryptographic
+   :participants [:actor/holder :actor/figure :actor/independent-custodian]
+   :coordinator :variable ; could be Figure, could be holder
+   :inputs [] ; no prior shares
+   :outputs [:crypto/wallet-keygen-output ; one per party
+             :crypto/wallet-public-key]
+   :authorization "Holder must demonstrate identity to Figure for
+                   wallet creation per Figure's onboarding policy.
+                   This is application-layer, not cryptographic."
+   :scheme :scheme/ot-based-ecdsa-secp256k1
+   :phases [:phase/dkg]}
+
+  :ceremony/triple-generation
+  {:id :ceremony/triple-generation
+   :name "Triple generation ceremony"
+   :description "Holder + Figure pre-generate Beaver triples to
+                 stockpile for future signing. The IC is offline and
+                 not involved. Output is one or more triple shares,
+                 stored in each party's stockpile."
+   :kind :kind/cryptographic
+   :participants [:actor/holder :actor/figure]
+   :coordinator :actor/figure
+   :inputs [:crypto/wallet-keygen-output]
+   :outputs [:crypto/triple-share]
+   :authorization "Holder requests, Figure participates per service
+                   agreement. No attestation gate required (no
+                   structural change)."
+   :scheme :scheme/ot-based-ecdsa-secp256k1}
+
+  :ceremony/presign
+  {:id :ceremony/presign
+   :name "Presign ceremony"
+   :description "Holder + Figure consume one Beaver triple to produce
+                 a presignature. May be run synchronously with sign
+                 (combined ceremony) or in advance for stockpiling.
+                 IC offline."
+   :kind :kind/cryptographic
+   :participants [:actor/holder :actor/figure]
+   :coordinator :actor/figure
+   :inputs [:crypto/wallet-keygen-output :crypto/triple-share]
+   :outputs [:crypto/presignature]
+   :authorization "No attestation gate; presign is preparation,
+                   not commitment."
+   :scheme :scheme/ot-based-ecdsa-secp256k1}
+
+  :ceremony/sign
+  {:id :ceremony/sign
+   :name "Sign ceremony"
+   :description "Holder + Figure consume one presignature to produce
+                 a transaction signature. The IC is offline. Triggered
+                 by holder's :crypto/sign-request. Figure may refuse
+                 to participate based on issuer policy."
+   :kind :kind/cryptographic
+   :participants [:actor/holder :actor/figure]
+   :coordinator :actor/figure
+   :inputs [:crypto/wallet-keygen-output
+            :crypto/presignature
+            :crypto/sign-request]
+   :outputs [:crypto/transaction-signature]
+   :authorization "Figure applies issuer policy to the
+                   :crypto/sign-request. Holder's authorization is
+                   their cryptographic participation in the ceremony."
+   :scheme :scheme/ot-based-ecdsa-secp256k1}
+
+  :ceremony/reshare-recovery
+  {:id :ceremony/reshare-recovery
+   :name "Recovery reshare ceremony"
+   :description "UC2: holder lost their share. Figure + IC + new_holder
+                 (a fresh holder identity) run a reshare-with-member-
+                 change protocol. Public key preserved. Old holder
+                 share invalidated. Authorization requires attestation
+                 + recovery intent."
+   :kind :kind/cryptographic
+   :participants [:actor/figure :actor/independent-custodian
+                  :actor/holder] ; new_holder identity, fresh
+   :coordinator :actor/figure
+   :inputs [:crypto/wallet-keygen-output ; from Figure and IC
+            :crypto/wallet-public-key
+            :crypto/recovery-intent
+            :crypto/identity-attestation] ; or :crypto/commitment-attestation, etc.
+   :outputs [:crypto/wallet-keygen-output] ; fresh shares for the new participant set
+   :authorization "Figure and IC each independently verify:
+                   (1) valid attestation per :state/address-policy-registry,
+                   (2) valid recovery intent signed by the registered
+                       recovery key,
+                   (3) attestations and intent within freshness window,
+                   (4) objection window (if configured) has elapsed."
+   :scheme :scheme/ot-based-ecdsa-secp256k1
+   :phases [:phase/authorization-gate :phase/reshare]}
+
+  :ceremony/reshare-divorce
+  {:id :ceremony/reshare-divorce
+   :name "Divorce reshare ceremony"
+   :description "Holder voluntarily removes Figure from the wallet,
+                 optionally replacing with a new co-signer. Figure is
+                 not a participant: holder + IC drive the ceremony,
+                 with the new co-signer joining if one is designated.
+                 Authorization requires attestation + divorce intent.
+                 The IC is the verification authority since Figure is
+                 the party being removed."
+   :kind :kind/cryptographic
+   :participants [:actor/holder :actor/independent-custodian]
+   :coordinator :actor/independent-custodian
+   :inputs [:crypto/wallet-keygen-output ; from holder and IC
+            :crypto/wallet-public-key
+            :crypto/divorce-intent
+            :crypto/identity-attestation]
+   :outputs [:crypto/wallet-keygen-output] ; new shareset, may be 2-of-2 or 2-of-3
+   :authorization "IC independently verifies attestation and divorce
+                   intent. Figure does not authorize its own removal."
+   :scheme :scheme/ot-based-ecdsa-secp256k1
+   :phases [:phase/authorization-gate :phase/reshare]}
+
+  :ceremony/reshare-refresh
+  {:id :ceremony/reshare-refresh
+   :name "Refresh reshare ceremony"
+   :description "Periodic key hygiene: same participant set runs a
+                 reshare to produce fresh shares of the same public
+                 key. No member change. Limits the window in which any
+                 one share's compromise has cascading effect. Lower
+                 authorization bar than recovery or divorce."
+   :kind :kind/cryptographic
+   :participants [:actor/holder :actor/figure :actor/independent-custodian]
+   :coordinator :actor/figure
+   :inputs [:crypto/wallet-keygen-output
+            :crypto/wallet-public-key]
+   :outputs [:crypto/wallet-keygen-output] ; fresh shares, same public key
+   :authorization "Holder request plus Figure scheduled-policy
+                   confirmation. No attestation required because no
+                   structural change (membership, threshold, or
+                   public key)."
+   :scheme :scheme/ot-based-ecdsa-secp256k1
+   :phases [:phase/reshare]}
+
+  :ceremony/attestation-issuance
+  {:id :ceremony/attestation-issuance
+   :name "Attestation issuance"
+   :description "Holder requests an attestation from a TAS. TAS
+                 authenticates the holder per its method (KYC,
+                 commitment-secret reveal, social recovery contact
+                 confirmation) and issues a signed attestation. Not
+                 a multi-party cryptographic protocol; a single TAS
+                 issuing a credential."
+   :kind :kind/attestation
+   :participants [:actor/holder :role/attestation-service]
+   :coordinator :role/attestation-service
+   :inputs [:state/attestation-credentials]
+   :outputs [:crypto/identity-attestation] ; or other attestation kind
+   :authorization "TAS-specific. KYC: passes identity verification.
+                   Commitment: reveals secret matching registered hash.
+                   Social: k of n contacts confirm."
+   :phases [:phase/authentication :phase/issuance]}}
+
+ ;; ============================================================
+ ;; LAYER 5: EVENTS
+ ;; ============================================================
+ ;;
+ ;; Events are the abstract things that drive statechart transitions.
+ ;; Some events are message arrivals (mapped from the EDN vocabulary),
+ ;; some are time-originated, some are internal state changes.
+ ;;
+ ;; Each event entry includes:
+ ;;   :origin        -- :origin/external (from a party), :origin/timer,
+ ;;                     :origin/internal (state change)
+ ;;   :carries       -- payload entities (:crypto/*, :state/*, etc.)
+ ;;   :received-by   -- :actor/* that processes this event
+ ;;
+ :events
+ {:event/begin-ceremony
+  {:id :event/begin-ceremony
+   :name "Begin ceremony"
+   :description "Coordinator instructs a party to begin participating
+                 in a specific ceremony. Maps to :ceremony/begin-* in
+                 the EDN vocabulary. Carries ceremony-id, role, peers,
+                 and ceremony-type-specific parameters."
+   :origin :origin/external
+   :carries [:ceremony/* :keyword] ; ceremony-id, role
+   :received-by :role/share-holder}
+
+  :event/protocol-message-received
+  {:id :event/protocol-message-received
+   :name "Protocol message received"
+   :description "A protocol-relay message has arrived at a party from
+                 the coordinator (carrying it from another party).
+                 Maps to :protocol/deliver in the EDN vocabulary."
+   :origin :origin/external
+   :carries [:bytes] ; opaque protocol body
+   :received-by :role/share-holder}
+
+  :event/protocol-message-emit
+  {:id :event/protocol-message-emit
+   :name "Protocol message emitted"
+   :description "A party's protocol state has produced an outbound
+                 message. Maps to :protocol/private or
+                 :protocol/broadcast in the EDN vocabulary."
+   :origin :origin/internal
+   :carries [:bytes :keyword] ; body, recipient
+   :received-by :role/coordinator}
+
+  :event/ceremony-complete
+  {:id :event/ceremony-complete
+   :name "Ceremony complete"
+   :description "A party reports successful completion of its
+                 protocol participation, with the resulting output
+                 (handle reference, public key, signature, etc)."
+   :origin :origin/internal
+   :received-by :role/coordinator}
+
+  :event/ceremony-error
+  {:id :event/ceremony-error
+   :name "Ceremony error"
+   :description "A party reports protocol failure (bad parameters,
+                 protocol violation, abort, etc.)."
+   :origin :origin/internal
+   :received-by :role/coordinator}
+
+  :event/cancel
+  {:id :event/cancel
+   :name "Cancel ceremony"
+   :description "Coordinator cancels an in-progress ceremony.
+                 Triggered by user action, deadline expiry, or another
+                 party's error."
+   :origin :origin/external
+   :received-by :role/share-holder}
+
+  :event/deadline-elapsed
+  {:id :event/deadline-elapsed
+   :name "Deadline elapsed"
+   :description "Per-ceremony wall-clock deadline has been reached.
+                 Coordinator-side event that triggers cancel
+                 broadcast."
+   :origin :origin/timer
+   :received-by :role/coordinator}
+
+  :event/objection-window-elapsed
+  {:id :event/objection-window-elapsed
+   :name "Objection window elapsed"
+   :description "For ceremonies using publish-then-execute, the
+                 objection window has closed without objection.
+                 Authorization gate may now proceed."
+   :origin :origin/timer
+   :received-by :actor/figure} ; or :actor/independent-custodian for divorce
+
+  :event/attestation-received
+  {:id :event/attestation-received
+   :name "Attestation received"
+   :description "An attestation has arrived (typically as part of a
+                 ceremony begin message). The receiving party
+                 verifies the attestation's signature, freshness, and
+                 binding to the relevant public key."
+   :origin :origin/external
+   :carries [:crypto/identity-attestation] ; or other attestation kinds
+   :received-by [:actor/figure :actor/independent-custodian]}
+
+  :event/intent-received
+  {:id :event/intent-received
+   :name "Intent received"
+   :description "A holder-signed intent statement (recovery or divorce)
+                 has arrived. Receiving party verifies the signature
+                 against the registered recovery key."
+   :origin :origin/external
+   :carries [:crypto/recovery-intent] ; or :crypto/divorce-intent
+   :received-by [:actor/figure :actor/independent-custodian]}
+
+  :event/sign-request-received
+  {:id :event/sign-request-received
+   :name "Sign request received"
+   :description "Holder has requested signing of a transaction. Figure
+                 receives this and applies issuer policy before
+                 participating in the sign ceremony."
+   :origin :origin/external
+   :carries [:crypto/sign-request]
+   :received-by :actor/figure}
+
+  :event/triple-stockpile-low
+  {:id :event/triple-stockpile-low
+   :name "Triple stockpile low"
+   :description "Internal signal that the stockpile of pre-generated
+                 triples has fallen below a threshold and a new
+                 triple-generation ceremony should be scheduled.
+                 Optional optimization."
+   :origin :origin/internal
+   :received-by :actor/figure}}
+
+ ;; ============================================================
+ ;; CLASSIFICATIONS
+ ;; ============================================================
+ ;;
+ ;; Reference values used in entries above.
+
+ :role-classifications
+ {:role/share-holder      "Holds an MPC share"
+  :role/attestation-service "Issues signed attestations"
+  :role/end-user           "Initiates ceremonies on behalf of themselves"
+  :role/coordinator        "Routes protocol messages for a ceremony"}
+
+ :availability-classifications
+ {:availability/always-online "Online for all wallet operations"
+  :availability/on-demand     "Online when holder is transacting"
+  :availability/reserved      "Online only for structural ceremonies"
+  :availability/per-ceremony  "Online for one specific ceremony"}
+
+ :scheme-classifications
+ {:scheme/ot-based-ecdsa-secp256k1
+  "OT-based ECDSA on secp256k1, via threshold-signatures::ecdsa::ot_based_ecdsa.
+   Production protocol for YLDS wallet operations."
+
+  :scheme/ed25519
+  "Ed25519 signatures, used for attestation-service signing keys."
+
+  :scheme/ecdsa-secp256k1
+  "Standard non-threshold ECDSA, used for holder recovery key."
+
+  :scheme/hash-commitment
+  "Cryptographic hash commitment, registered at wallet setup, revealed
+   at recovery time."}
+
+ :scope-classifications
+ {:scope/exploration-harness-only "Exists only in the harness; no production analog"
+  :scope/production-only          "Exists only in production; harness has different shape"
+  :scope/both                     "Exists in both, possibly with different details"}}

@@ -1,0 +1,19 @@
+{:paths ["party/src"]
+ :deps  {com.github.franks42/uuidv7 {:mvn/version "0.5.0"}
+         com.taoensso/trove          {:mvn/version "1.1.0"}
+         com.taoensso/timbre         {:mvn/version "6.8.0"}}
+
+ :tasks
+ {lint   {:doc  "clj-kondo across all source paths"
+          :task (shell "clj-kondo" "--lint" "orchestrator/src" "party/src")}
+
+  format {:doc  "cljfmt fix across all source paths"
+          :task (shell "cljfmt" "fix" "orchestrator/src" "party/src")}
+
+  check  {:doc  "Run lint + format"
+          :task (do (run 'format) (run 'lint))}
+
+  null-party
+  {:doc  "Run a null party stub. Args: --role <holder|figure|ic>"
+   :task (apply (requiring-resolve 'mpc-multi-signature.party.null/-main)
+                *command-line-args*)}}}
