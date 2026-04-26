@@ -202,7 +202,7 @@
 ;; c = SHA-256(R || X_i || context) and check s·G == R + c·X_i.
 ;;
 ;; Implementation uses BC's secp256k1 curve parameters via reflection
-;; (BC is on classpath via signet 0.4.0). Independent of both the
+;; (BC is on classpath via signet 0.5.0). Independent of both the
 ;; threshold-signatures crate and our crypto-core's Rust prover —
 ;; genuine cross-validation.
 
