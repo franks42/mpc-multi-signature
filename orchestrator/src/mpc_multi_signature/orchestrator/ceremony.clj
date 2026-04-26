@@ -126,72 +126,246 @@
                        :ceremony/reason reason})
          (catch Exception _e nil))))
 
-(defn run-keygen
-  "Drive a single keygen ceremony to completion. Returns a result map:
+(defn- run-ceremony
+  "Generic ceremony lifecycle driver conforming to the keygen statechart
+   template. Caller supplies `make-begin-msg` (per-role begin EDN) and
+   `finalize-fn` (results-map → {:passed? bool :result map :reason kw?}).
 
-     {:public-key   <string>
-      :handles      {role <uuid> ...}
-      :ceremony/id  <uuid>}
+   Returns the finalize-fn's `:result` on success, or
+   {:error <reason> :ceremony/id ... :details ...} on failure."
+  [{:keys [connections-by-role]} ceremony-id participants
+   make-begin-msg finalize-fn deadline-ms]
+  (transition! ceremony-id :state/pending :state/starting)
+  (send-begin-to-all! connections-by-role participants make-begin-msg)
+  (transition! ceremony-id :state/starting :state/running)
+  (let [{:keys [results error] :as outcome}
+        (await-completes connections-by-role participants deadline-ms)]
+    (cond
+      error
+      (do
+        (transition! ceremony-id :state/running :state/aborting)
+        (send-cancel-to-all! connections-by-role participants ceremony-id error)
+        (transition! ceremony-id :state/aborting :state/failed)
+        (log/log! {:level :error
+                   :id    :mpc-multi-signature.orchestrator.ceremony/failed
+                   :msg   "Ceremony failed"
+                   :data  {:ceremony-id ceremony-id :outcome outcome}})
+        {:error error :ceremony/id ceremony-id :details outcome})
 
-   on success, or:
-
-     {:error <reason-keyword> ...}
-
-   on failure. Synchronous from the caller's perspective; internally
-   uses core.async to wait on multiple inbound channels."
-  [{:keys [connections-by-role]} participants {:keys [threshold deadline-ms]
-                                               :or   {threshold 2 deadline-ms 5000}}]
-  (let [ceremony-id  (uuidv7/uuidv7)
-        share-handle (uuidv7/uuidv7)
-        make-begin   (fn [me]
-                       {:msg/type            :ceremony/begin-keygen
-                        :ceremony/id         ceremony-id
-                        :ceremony/me         me
-                        :ceremony/peers      (vec participants)
-                        :ceremony/threshold  threshold
-                        :ceremony/share-handle share-handle
-                        :ceremony/scheme     :ecdsa/secp256k1-ot-based})]
-    (transition! ceremony-id :state/pending :state/starting)
-    (send-begin-to-all! connections-by-role participants make-begin)
-
-    (transition! ceremony-id :state/starting :state/running)
-    (let [{:keys [results error] :as outcome}
-          (await-completes connections-by-role participants deadline-ms)]
-      (cond
-        error
-        (do
-          (transition! ceremony-id :state/running :state/aborting)
-          (send-cancel-to-all! connections-by-role participants ceremony-id error)
-          (transition! ceremony-id :state/aborting :state/failed)
-          (log/log! {:level :error
-                     :id    :mpc-multi-signature.orchestrator.ceremony/failed
-                     :msg   "Ceremony failed"
-                     :data  {:ceremony-id ceremony-id :outcome outcome}})
-          {:error error :ceremony/id ceremony-id :details outcome})
-
-        :else
-        (let [_ (transition! ceremony-id :state/running :state/finalizing)
-              {:keys [passed? public-key reason] :as check}
-              (keygen-consistency-check results)]
-          (if passed?
-            (let [handles (into {} (map (fn [[r _m]] [r share-handle])) results)
-                  result  {:public-key   public-key
-                           :share-handle share-handle
-                           :handles      handles ; legacy: all roles map to share-handle
-                           :ceremony/id  ceremony-id}]
-              (transition! ceremony-id :state/finalizing :state/complete)
+      :else
+      (let [_ (transition! ceremony-id :state/running :state/finalizing)
+            {:keys [passed? result reason] :as check} (finalize-fn results)]
+        (if passed?
+          (do (transition! ceremony-id :state/finalizing :state/complete)
               (log/log! {:level :info
                          :id    :mpc-multi-signature.orchestrator.ceremony/complete
                          :msg   "Ceremony complete"
                          :data  {:ceremony-id ceremony-id
-                                 :public-key  public-key
-                                 :handles     handles}})
+                                 :result (dissoc result :raw-results)}})
               result)
-            (do
-              (transition! ceremony-id :state/finalizing :state/aborting)
+          (do (transition! ceremony-id :state/finalizing :state/aborting)
               (send-cancel-to-all! connections-by-role participants ceremony-id reason)
               (transition! ceremony-id :state/aborting :state/failed)
               (log/log! {:level :error
                          :id    :mpc-multi-signature.orchestrator.ceremony/finalization-failed
                          :data  {:ceremony-id ceremony-id :check check}})
-              {:error reason :ceremony/id ceremony-id :details check})))))))
+              {:error reason :ceremony/id ceremony-id :details check}))))))
+
+(defn run-keygen
+  "Drive a keygen ceremony; returns
+     {:public-key <hex> :share-handle <uuid> :handles {role <uuid>} :ceremony/id <uuid>}
+   on success."
+  [orch participants {:keys [threshold deadline-ms]
+                      :or   {threshold 2 deadline-ms 30000}}]
+  (let [ceremony-id  (uuidv7/uuidv7)
+        share-handle (uuidv7/uuidv7)
+        peers        (vec participants)
+        make-begin   (fn [me]
+                       {:msg/type              :ceremony/begin-keygen
+                        :ceremony/id           ceremony-id
+                        :ceremony/me           me
+                        :ceremony/peers        peers
+                        :ceremony/threshold    threshold
+                        :ceremony/share-handle share-handle})
+        finalize     (fn [results]
+                       (let [check (keygen-consistency-check results)]
+                         (if (:passed? check)
+                           {:passed? true
+                            :result {:public-key   (:public-key check)
+                                     :share-handle share-handle
+                                     :handles      (into {} (for [r peers] [r share-handle]))
+                                     :ceremony/id  ceremony-id}}
+                           {:passed? false :reason (:reason check) :details check})))]
+    (run-ceremony orch ceremony-id peers make-begin finalize deadline-ms)))
+
+;; ============================================================
+;; Stage 4 ceremonies: triple-generation, presign, sign, reshare
+;; ============================================================
+
+(defn run-triple-generation
+  "Drive a triple-generation ceremony. Each party produces shares of
+   two Beaver triples (consumed together by one presign). Result:
+     {:triple-handle <uuid> :handles {role uuid} :ceremony/id <uuid>}"
+  [orch participants {:keys [threshold deadline-ms]
+                      :or   {threshold 2 deadline-ms 60000}}]
+  (let [ceremony-id   (uuidv7/uuidv7)
+        triple-handle (uuidv7/uuidv7)
+        peers         (vec participants)
+        make-begin    (fn [me]
+                        {:msg/type              :ceremony/begin-triples
+                         :ceremony/id           ceremony-id
+                         :ceremony/me           me
+                         :ceremony/peers        peers
+                         :ceremony/threshold    threshold
+                         :ceremony/triple-handle triple-handle})
+        finalize      (fn [_results]
+                        ;; Triples have no cross-party consistency check
+                        ;; on the orchestrator side; we trust the protocol.
+                        {:passed? true
+                         :result  {:triple-handle triple-handle
+                                   :handles       (into {} (for [r peers] [r triple-handle]))
+                                   :ceremony/id   ceremony-id}})]
+    (run-ceremony orch ceremony-id peers make-begin finalize deadline-ms)))
+
+(defn run-presign
+  "Drive a presign ceremony, consuming a keygen share + a triple pair,
+   producing a presignature stored per-party. Result:
+     {:presig-handle <uuid> :handles {role uuid} :ceremony/id <uuid>}"
+  [orch participants {:keys [threshold share-handle triple-handle deadline-ms]
+                      :or   {threshold 2 deadline-ms 60000}}]
+  (assert share-handle  "run-presign: :share-handle required")
+  (assert triple-handle "run-presign: :triple-handle required")
+  (let [ceremony-id   (uuidv7/uuidv7)
+        presig-handle (uuidv7/uuidv7)
+        peers         (vec participants)
+        make-begin    (fn [me]
+                        {:msg/type              :ceremony/begin-presign
+                         :ceremony/id           ceremony-id
+                         :ceremony/me           me
+                         :ceremony/peers        peers
+                         :ceremony/threshold    threshold
+                         :ceremony/share-handle share-handle
+                         :ceremony/triple-handle triple-handle
+                         :ceremony/presig-handle presig-handle})
+        finalize      (fn [_results]
+                        {:passed? true
+                         :result  {:presig-handle presig-handle
+                                   :handles       (into {} (for [r peers] [r presig-handle]))
+                                   :ceremony/id   ceremony-id}})]
+    (run-ceremony orch ceremony-id peers make-begin finalize deadline-ms)))
+
+(defn- sign-consistency-check
+  "Statechart action :action/sign-consistency-check. The coordinator
+   returns the signature; non-coordinators return null. Verify that
+   exactly one party returned a non-null signature."
+  [results coordinator]
+  (let [coord-result (get results coordinator)
+        sig          (:result/signature-hex coord-result)
+        non-coord-sigs (->> (dissoc results coordinator)
+                            vals
+                            (map :result/signature-hex)
+                            (remove nil?))]
+    (cond
+      (nil? sig)
+      {:passed? false :reason :reason/no-signature-from-coordinator}
+
+      (seq non-coord-sigs)
+      {:passed? false :reason :reason/non-coordinator-emitted-signature}
+
+      :else
+      {:passed? true :signature-hex sig})))
+
+(defn run-sign
+  "Drive a sign ceremony. Consumes the keygen share and a presignature;
+   the coordinator party produces an ECDSA signature. Result:
+     {:signature-hex <64-byte raw r||s in hex>
+      :coordinator <role>  :ceremony/id <uuid>}"
+  [orch participants {:keys [threshold coordinator share-handle presig-handle
+                             digest-hex deadline-ms]
+                      :or   {threshold 2 deadline-ms 60000}}]
+  (assert share-handle  "run-sign: :share-handle required")
+  (assert presig-handle "run-sign: :presig-handle required")
+  (assert digest-hex    "run-sign: :digest-hex required (32-byte hex)")
+  (assert coordinator   "run-sign: :coordinator required (role keyword)")
+  (let [ceremony-id (uuidv7/uuidv7)
+        peers       (vec participants)
+        make-begin  (fn [me]
+                      {:msg/type              :ceremony/begin-sign
+                       :ceremony/id           ceremony-id
+                       :ceremony/me           me
+                       :ceremony/peers        peers
+                       :ceremony/threshold    threshold
+                       :ceremony/coordinator  coordinator
+                       :ceremony/share-handle share-handle
+                       :ceremony/presig-handle presig-handle
+                       :ceremony/digest-hex   digest-hex})
+        finalize    (fn [results]
+                      (let [check (sign-consistency-check results coordinator)]
+                        (if (:passed? check)
+                          {:passed? true
+                           :result {:signature-hex (:signature-hex check)
+                                    :coordinator   coordinator
+                                    :ceremony/id   ceremony-id}}
+                          {:passed? false :reason (:reason check)
+                           :details {:results results}})))]
+    (run-ceremony orch ceremony-id peers make-begin finalize deadline-ms)))
+
+(defn- reshare-consistency-check
+  "Reshare must preserve the public key. All new participants report
+   their post-reshare public-key-hex; all must match the original
+   public-key passed in."
+  [results expected-pk-hex]
+  (let [pks (into #{} (map :result/public-key-hex) (vals results))]
+    (cond
+      (= 1 (count pks)) (let [pk (first pks)]
+                          (if (= pk expected-pk-hex)
+                            {:passed? true :public-key pk}
+                            {:passed? false
+                             :reason :reason/public-key-not-preserved
+                             :expected expected-pk-hex
+                             :got pk}))
+      :else {:passed? false :reason :reason/public-key-disagreement
+             :public-keys pks})))
+
+(defn run-reshare
+  "Drive a reshare ceremony — `old-participants` and `new-participants`
+   may differ (UC2: holder→new-holder, with figure+ic continuing). All
+   parties in the union of old+new participate.
+   Result: {:public-key <preserved hex> :share-handle <new uuid>
+            :handles {role uuid} :ceremony/id <uuid>}"
+  [orch {:keys [old-participants new-participants old-threshold new-threshold
+                old-share-handle public-key-hex deadline-ms]
+         :or   {old-threshold 2 new-threshold 2 deadline-ms 60000}}]
+  (assert public-key-hex "run-reshare: :public-key-hex required (continuity anchor)")
+  (let [ceremony-id      (uuidv7/uuidv7)
+        new-share-handle (uuidv7/uuidv7)
+        ;; All parties in old ∪ new participate in the protocol.
+        all-peers        (vec (distinct (concat old-participants new-participants)))
+        make-begin       (fn [me]
+                           {:msg/type                 :ceremony/begin-reshare
+                            :ceremony/id              ceremony-id
+                            :ceremony/me              me
+                            :ceremony/old-peers       (vec old-participants)
+                            :ceremony/old-threshold   old-threshold
+                            :ceremony/new-peers       (vec new-participants)
+                            :ceremony/new-threshold   new-threshold
+                            :ceremony/old-share-handle (when (some #{me} old-participants)
+                                                         old-share-handle)
+                            :ceremony/new-share-handle new-share-handle
+                            :ceremony/public-key-hex   public-key-hex})
+        finalize         (fn [results]
+                           ;; Only new participants emit a public-key result;
+                           ;; filter results to just those.
+                           (let [new-results (select-keys results new-participants)
+                                 check       (reshare-consistency-check
+                                              new-results public-key-hex)]
+                             (if (:passed? check)
+                               {:passed? true
+                                :result {:public-key   (:public-key check)
+                                         :share-handle new-share-handle
+                                         :handles      (into {}
+                                                             (for [r new-participants]
+                                                               [r new-share-handle]))
+                                         :ceremony/id  ceremony-id}}
+                               {:passed? false :reason (:reason check) :details check})))]
+    (run-ceremony orch ceremony-id all-peers make-begin finalize deadline-ms)))

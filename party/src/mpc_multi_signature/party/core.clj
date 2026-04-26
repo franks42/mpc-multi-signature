@@ -276,7 +276,15 @@
 
 ;; ---- per-ceremony state machine ----
 
-(defn- run-ceremony! [role begin-msg in-reader out-writer]
+(declare begin-types)
+
+(defn- run-ceremony!
+  "Run one ceremony to completion. Returns:
+     nil          — orchestrator EOF or cancel;
+     <begin-msg>  — orchestrator sent a begin-* message after this
+                    ceremony finished (its Rust subprocess exited);
+                    -main hands it to a fresh run-ceremony! invocation."
+  [role begin-msg in-reader out-writer]
   (let [peers          (begin-msg-peers begin-msg)
         r->i           (role->id-map peers)
         i->r           (id->role-map peers)
@@ -284,7 +292,14 @@
         rust-process   (spawn-crypto-core! role)
         rust-stdin     (BufferedWriter. (java.io.OutputStreamWriter.
                                          (.getOutputStream rust-process)))
-        done?          (atom false)]
+        done?          (atom false)
+        wait-and-log!  (fn []
+                         (try (.close rust-stdin) (catch Exception _ nil))
+                         (.waitFor rust-process)
+                         (log/log! {:level :info
+                                    :id    :mpc-multi-signature.party.core/ceremony-end
+                                    :data  {:role role
+                                            :exit-code (.exitValue rust-process)}}))]
     (spawn-rust-reader-thread! role i->r ceremony-id
                                (.getInputStream rust-process) out-writer done?)
     (send-json! rust-stdin (begin->json begin-msg))
@@ -293,11 +308,12 @@
                      (catch Exception _e ::eof))]
         (cond
           (= ::eof msg)
-          (do (try (.close rust-stdin) (catch Exception _ nil))
-              (.waitFor rust-process)
-              (log/log! {:level :info
-                         :id    :mpc-multi-signature.party.core/ceremony-end
-                         :data  {:role role :exit-code (.exitValue rust-process)}}))
+          (do (wait-and-log!) nil)
+
+          ;; A begin-* for the NEXT ceremony — this one's Rust
+          ;; subprocess has finished; let -main pick it up.
+          (begin-types (:msg/type msg))
+          (do (wait-and-log!) msg)
 
           (= :protocol/deliver (:msg/type msg))
           (do (if @done?
@@ -314,8 +330,8 @@
           (= :ceremony/cancel (:msg/type msg))
           (do (try (send-json! rust-stdin (cancel->json msg))
                    (catch java.io.IOException _e nil))
-              (try (.close rust-stdin) (catch Exception _ nil))
-              (.waitFor rust-process))
+              (wait-and-log!)
+              nil)
 
           :else
           (do (log/log! {:level :warn
@@ -338,9 +354,10 @@
     (init-telemetry! role)
     (let [in-reader  (PushbackReader. *in*)
           out-writer *out*]
-      (loop []
-        (let [msg (try (edn/read {:eof ::eof} in-reader)
-                       (catch Exception _e ::eof))]
+      (loop [pending nil]
+        (let [msg (or pending
+                      (try (edn/read {:eof ::eof} in-reader)
+                           (catch Exception _e ::eof)))]
           (cond
             (= ::eof msg)
             (log/log! {:level :info
@@ -348,11 +365,12 @@
                        :data  {:role role}})
 
             (begin-types (:msg/type msg))
-            (do (run-ceremony! role msg in-reader out-writer)
-                (recur))
+            ;; run-ceremony! returns either nil (clean end) or the
+            ;; next begin-* message; we chain on whichever it returned.
+            (recur (run-ceremony! role msg in-reader out-writer))
 
             :else
             (do (log/log! {:level :warn
                            :id    :mpc-multi-signature.party.core/pre-ceremony-msg
                            :data  {:role role :msg-type (:msg/type msg)}})
-                (recur))))))))
+                (recur nil))))))))
