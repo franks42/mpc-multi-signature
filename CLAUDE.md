@@ -196,20 +196,26 @@ Architecture invariants locked in Stages 1–4 (carry forward):
    ceremony. EDN vocabulary + statecharts span both contexts
    unchanged (same contract, different process).
 
-Spec issues found and worked around (still pending fix in the spec
-files themselves):
+Spec issues fixed 2026-04-26 (all three statechart EDN files now
+parse cleanly via `clojure.edn/read-string`):
 
-1. `specs/statechart-keygen.edn` lines 95–106 + `statechart-sign.edn`
-   lines 120–129: duplicate `:event/ceremony-complete` keys in
-   `:state/running`'s `:on` map — invalid EDN. Implementation uses
-   guarded transitions properly; spec needs the same fix.
-2. Both charts use `{:like :region/holder :substitute-actor X}`
-   shorthand — not real `clj-statecharts` syntax; needs preprocessor
-   or explicit per-region expansion.
-3. Design doc Appendix A uses `:ceremony/error/category` and
-   `:ceremony/error/message` — multi-slash keywords are invalid EDN.
-   Implementation uses nested-map `:ceremony/error {:category ...
-   :message ...}`; appendix needs the same.
+1. Duplicate `:event/ceremony-complete` keys in `:state/running`'s
+   `:on` map (and the analogous duplicate `:event/both-gates-passed`
+   in reshare-recovery's `:state/authorization-gate`): collapsed into
+   a single key whose value is a vector of guarded transitions
+   evaluated in order. Same semantic intent, valid EDN +
+   clj-statecharts shape.
+2. The `{:like :region/holder :substitute-actor X}` shorthand was not
+   real `clj-statecharts` syntax (and reshare-recovery referenced a
+   `:region/holder-template` that was never defined). Each parallel
+   region is now expanded inline with the appropriate
+   `(guard/originated-from :actor/X)` substitution.
+3. Design doc Appendix A's `:ceremony/error/category`,
+   `:ceremony/error/message`, `:ceremony/progress/round` and
+   `:ceremony/progress/total` (multi-slash keywords, invalid EDN) now
+   use the nested-map form already used by the implementation:
+   `:ceremony/error {:category ... :message ...}` and
+   `:ceremony/progress {:round ... :total ...}`.
 
 ## Implementation hints
 

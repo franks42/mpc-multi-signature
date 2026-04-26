@@ -104,15 +104,16 @@
           {:target :state/aborting
            :actions [:action/record-ic-gate-fail]}
 
-          :event/both-gates-passed
           ;; Synthesized by :action/check-both-gates-passed when both
-          ;; gate-pass events have been recorded.
-          {:target :state/objection-window
-           :guards [(guard/objection-window-required)]}
-
+          ;; gate-pass events have been recorded. Guarded transitions
+          ;; evaluated in order: route through :state/objection-window
+          ;; if address policy requires it, otherwise straight to
+          ;; :state/starting.
           :event/both-gates-passed
-          {:target :state/starting
-           :guards [(guard/objection-window-not-required)]}
+          [{:target :state/objection-window
+            :guards [(guard/objection-window-required)]}
+           {:target :state/starting
+            :guards [(guard/objection-window-not-required)]}]
 
           :event/cancel
           {:target :state/aborting
@@ -176,16 +177,18 @@
         {:target :state/running
          :actions [:action/route-message]}
 
+        ;; See keygen chart for the rationale. Vector of guarded
+        ;; transitions evaluated in order: stay in :running while
+        ;; other parties are still pending; advance to :finalizing on
+        ;; the last party's completion.
         :event/ceremony-complete
-        {:target  :state/running
-         :actions [:action/record-party-done
-                   :action/check-all-parties-done]
-         :guards  [(guard/at-least-one-party-still-running)]}
-
-        :event/ceremony-complete
-        {:target  :state/finalizing
-         :actions [:action/record-party-done]
-         :guards  [(guard/all-parties-done-after-this-event)]}
+        [{:target  :state/running
+          :actions [:action/record-party-done
+                    :action/check-all-parties-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
 
         :event/ceremony-error
         {:target  :state/aborting
@@ -200,13 +203,53 @@
         {:target  :state/aborting
          :actions [:action/record-timeout]}}
 
+   ;; Three parallel regions for the new participant set: Figure, IC,
+   ;; and the new_holder identity (which is rendered as :actor/holder
+   ;; in this chart — see :ceremony/new-participants in context).
+   ;; Expanded inline rather than via {:like ... :substitute-actor ...}
+   ;; shorthand so the chart parses as plain clj-statecharts data.
    :statechart/parallel-regions
-   {:region/figure {:like :region/holder-template
-                    :substitute-actor :actor/figure}
-    :region/independent-custodian {:like :region/holder-template
-                                   :substitute-actor :actor/independent-custodian}
-    :region/new-holder {:like :region/holder-template
-                        :substitute-actor :actor/holder}}}
+   {:region/figure
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/figure)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/independent-custodian
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/independent-custodian)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/new-holder
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/holder)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}}}
 
   :state/finalizing
   ;; Recovery-specific consistency check: every party's reported new

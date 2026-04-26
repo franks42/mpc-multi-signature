@@ -92,18 +92,20 @@
         {:target :state/running
          :actions [:action/route-message]}
 
+        ;; A party reports its share of the work is done. Guarded
+        ;; transitions are evaluated in order; the first matching
+        ;; guard wins. While other parties are still running we stay
+        ;; in :running and just record the party's completion; when
+        ;; this event is the last party's done we advance to
+        ;; :finalizing.
         :event/ceremony-complete
-        ;; A party reports its share of the work is done.
-        {:target  :state/running ; or :state/finalizing if last party
-         :actions [:action/record-party-done
-                   :action/check-all-parties-done]
-         :guards  [(guard/at-least-one-party-still-running)]}
-
-        :event/ceremony-complete
-        ;; Last party reports done: transition to finalizing.
-        {:target  :state/finalizing
-         :actions [:action/record-party-done]
-         :guards  [(guard/all-parties-done-after-this-event)]}
+        [{:target  :state/running
+          :actions [:action/record-party-done
+                    :action/check-all-parties-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
 
         :event/ceremony-error
         {:target  :state/aborting
@@ -122,6 +124,11 @@
    ;; independently, driven by message and event traffic. The
    ;; aggregate :running state guards above synthesize the per-party
    ;; states into ceremony-wide transitions.
+   ;; Per-party regions. Holder, Figure and the IC each have an
+   ;; identically shaped substate machine; only the actor parameter
+   ;; threaded into (guard/originated-from ...) differs. Expanded
+   ;; inline rather than via a {:like ... :substitute-actor ...}
+   ;; shorthand so the chart parses as plain clj-statecharts data.
    :statechart/parallel-regions
    {:region/holder
     {:initial :party-state/awaiting
@@ -143,10 +150,33 @@
                ;; Terminal substate within :running.
                {}}}
 
-    :region/figure {:like :region/holder
-                    :substitute-actor :actor/figure}
-    :region/independent-custodian {:like :region/holder
-                                   :substitute-actor :actor/independent-custodian}}}
+    :region/figure
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/figure)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/independent-custodian
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/independent-custodian)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}}}
 
   :state/finalizing
   ;; All parties report done. Apply ceremony-type-specific

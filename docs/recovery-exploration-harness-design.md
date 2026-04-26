@@ -978,14 +978,14 @@ implementation plan will refine these into the final form.
 ;; Ceremony failed.
 {:msg/type :ceremony/error
  :ceremony/id #uuid "..."
- :ceremony/error/category :bad-parameters
- :ceremony/error/message "..."}
+ :ceremony/error {:category :bad-parameters
+                  :message  "..."}}
 
 ;; (Optional) Heartbeat / progress.
 {:msg/type :ceremony/progress
  :ceremony/id #uuid "..."
- :ceremony/progress/round 3
- :ceremony/progress/total 7}
+ :ceremony/progress {:round 3
+                     :total 7}}
 ```
 
 The full vocabulary is approximately a dozen message shapes. Each

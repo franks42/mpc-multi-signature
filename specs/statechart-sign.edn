@@ -117,16 +117,19 @@
         {:target :state/running
          :actions [:action/route-message]}
 
+        ;; See keygen chart for the rationale. Vector of guarded
+        ;; transitions evaluated in order: the first matching guard
+        ;; wins, so we stay in :running while other parties are still
+        ;; pending and advance to :finalizing on the last party's
+        ;; completion.
         :event/ceremony-complete
-        {:target  :state/running
-         :actions [:action/record-party-done
-                   :action/check-all-parties-done]
-         :guards  [(guard/at-least-one-party-still-running)]}
-
-        :event/ceremony-complete
-        {:target  :state/finalizing
-         :actions [:action/record-party-done]
-         :guards  [(guard/all-parties-done-after-this-event)]}
+        [{:target  :state/running
+          :actions [:action/record-party-done
+                    :action/check-all-parties-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
 
         :event/ceremony-error
         {:target  :state/aborting
@@ -141,6 +144,10 @@
         {:target  :state/aborting
          :actions [:action/record-timeout]}}
 
+   ;; Two parallel regions (no IC; routine signing is 2-of-3 with
+   ;; {holder, Figure} only). Each region is expanded inline rather
+   ;; than via {:like ... :substitute-actor ...} shorthand so the
+   ;; chart parses as plain clj-statecharts data.
    :statechart/parallel-regions
    {:region/holder
     {:initial :party-state/awaiting
@@ -156,8 +163,19 @@
                :party-state/done {}
                :party-state/errored {}}}
 
-    :region/figure {:like :region/holder
-                    :substitute-actor :actor/figure}}}
+    :region/figure
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/figure)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}}}
 
   :state/finalizing
   ;; Sign-specific consistency check: the coordinator's reported
