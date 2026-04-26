@@ -23,6 +23,7 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [signet.key :as signet-key]
+            [signet.sign :as signet-sign]
             [taoensso.timbre :as timbre]
             [taoensso.trove :as log]
             [taoensso.trove.timbre :as backend])
@@ -61,6 +62,13 @@
 
 (defn- bytes->hex [^bytes bs]
   (apply str (map #(format "%02x" (bit-and % 0xff)) bs)))
+
+(defn- hex->bytes [^String s]
+  (let [n   (quot (count s) 2)
+        out (byte-array n)]
+    (dotimes [i n]
+      (aset out i (unchecked-byte (Integer/parseInt (subs s (* i 2) (+ (* i 2) 2)) 16))))
+    out))
 
 (defn- make-identity-keypair
   "Generate a fresh Ed25519 identity keypair for this bb wrapper. A
@@ -261,8 +269,24 @@
     (.write ^java.io.Writer out "\n")
     (.flush ^java.io.Writer out)))
 
+(defn- augment-with-binding-signature
+  "When the begin message had :ceremony/binding-mode? true, the bb
+   wrapper signs the Schnorr proof bytes locally with its own Ed25519
+   identity key and adds :result/identity-pubkey-hex and
+   :result/identity-signature-hex to the ceremony-complete result.
+   Welds this party's Ed25519 identity to the MPC share without ever
+   exposing the private key to the orchestrator."
+  [{:ceremony/keys [result] :as msg} identity-kp]
+  (let [proof-bytes (hex->bytes (:result/proof-hex result))
+        sig-bytes   (signet-sign/sign identity-kp proof-bytes)]
+    (assoc msg :ceremony/result
+           (assoc result
+                  :result/identity-pubkey-hex    (bytes->hex (:x identity-kp))
+                  :result/identity-signature-hex (bytes->hex sig-bytes)))))
+
 (defn- spawn-rust-reader-thread!
-  [role i->r ceremony-id-uuid rust-stdout out done?]
+  [role i->r ceremony-id-uuid rust-stdout out done?
+   {:keys [binding-mode? identity-kp]}]
   (let [reader (BufferedReader. (java.io.InputStreamReader. rust-stdout))]
     (doto (Thread. ^Runnable
            (fn []
@@ -271,7 +295,11 @@
                  (let [line (.readLine reader)]
                    (when line
                      (let [m   (json/parse-string line)
-                           edn (json->edn-out i->r ceremony-id-uuid m)]
+                           edn (json->edn-out i->r ceremony-id-uuid m)
+                           edn (if (and binding-mode?
+                                        (= :ceremony/complete (:msg/type edn)))
+                                 (augment-with-binding-signature edn identity-kp)
+                                 edn)]
                        (when edn
                          (send-edn! out edn))
                        (when (#{"ceremony_complete" "ceremony_error"} (get m "msg_type"))
@@ -298,10 +326,12 @@
      <begin-msg>  — orchestrator sent a begin-* message after this
                     ceremony finished (its Rust subprocess exited);
                     -main hands it to a fresh run-ceremony! invocation."
-  [role begin-msg in-reader out-writer]
+  [role identity-kp begin-msg in-reader out-writer]
   (let [r->i           (ceremony-participant-ids begin-msg)
         i->r           (into {} (map (fn [[k v]] [v k])) r->i)
         ceremony-id    (:ceremony/id begin-msg)
+        binding-mode?  (and (= :ceremony/begin-share-proof (:msg/type begin-msg))
+                            (boolean (:ceremony/binding-mode? begin-msg)))
         rust-process   (spawn-crypto-core! role)
         rust-stdin     (BufferedWriter. (java.io.OutputStreamWriter.
                                          (.getOutputStream rust-process)))
@@ -314,7 +344,8 @@
                                     :data  {:role role
                                             :exit-code (.exitValue rust-process)}}))]
     (spawn-rust-reader-thread! role i->r ceremony-id
-                               (.getInputStream rust-process) out-writer done?)
+                               (.getInputStream rust-process) out-writer done?
+                               {:binding-mode? binding-mode? :identity-kp identity-kp})
     (send-json! rust-stdin (begin->json begin-msg))
     (loop []
       (let [msg (try (edn/read {:eof ::eof} in-reader)
@@ -397,7 +428,7 @@
             (begin-types (:msg/type msg))
             ;; run-ceremony! returns either nil (clean end) or the
             ;; next begin-* message; we chain on whichever it returned.
-            (recur (run-ceremony! role msg in-reader out-writer))
+            (recur (run-ceremony! role identity-kp msg in-reader out-writer))
 
             :else
             (do (log/log! {:level :warn

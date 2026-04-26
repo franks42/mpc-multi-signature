@@ -34,16 +34,27 @@
    handle:
 
      {:connections-by-role {:holder ..., :figure ..., :ic ...}
+      :participant-ids     {role -> int}
+      :identity-pubkeys    {role -> hex string}
       :working-dir         <abs path>}
 
+   Stage 5b.2: each bb wrapper generates its own Ed25519 identity
+   keypair at startup and announces its public key via a
+   :party/identity handshake message. start-orchestrator blocks on
+   each handshake before returning. The orchestrator never sees any
+   party's private key — production placement of the identity key
+   material.
+
    `opts` (all optional):
-     :roles       — vector of role keywords; defaults to [:holder :figure :ic]
-     :working-dir — absolute path to project root; auto-detected by default
-     :bb-task     — bb task name used for every role; defaults to \"party\""
+     :roles            — vector of role keywords; defaults to [:holder :figure :ic]
+     :working-dir      — absolute path to project root; auto-detected by default
+     :bb-task          — bb task name used for every role; defaults to \"party\"
+     :handshake-timeout-ms — per-party handshake deadline; defaults to 5000"
   ([] (start-orchestrator {}))
-  ([{:keys [roles working-dir bb-task]
-     :or   {roles   default-roles
-            bb-task "party"}}]
+  ([{:keys [roles working-dir bb-task handshake-timeout-ms]
+     :or   {roles                default-roles
+            bb-task              "party"
+            handshake-timeout-ms 5000}}]
    (telemetry/ensure-initialized!)
    (let [wd (or working-dir (project-root))
          ;; Canonical role↔int map: each role's participant-id is its
@@ -52,28 +63,29 @@
          ;; bound to specific integer participant ids; if those drift
          ;; between ceremonies, presign rejects with "incorrect shares".
          participant-ids (into {} (map-indexed (fn [i r] [r i]) roles))
-         ;; Ed25519 identity keypair per role, via signet. HARNESS-ONLY
-         ;; placement: in production these belong at the bb wrapper
-         ;; (each party holds its own private key); we keep them
-         ;; orchestrator-side for now so identity-share binding proofs
-         ;; can be tested without bb-wrapper-config plumbing.
-         identity-keypairs (into {}
-                                 (for [role roles]
-                                   [role (do (require '[signet.key])
-                                             ((requiring-resolve 'signet.key/signing-keypair)))]))
          connections-by-role
          (into {}
                (for [role roles]
-                 [role (party/start! {:role role :working-dir wd :bb-task bb-task})]))]
+                 [role (party/start! {:role role :working-dir wd :bb-task bb-task})]))
+         ;; Block on the :party/identity handshake from each party
+         ;; before declaring the orchestrator ready. Private key stays
+         ;; with the bb wrapper; we capture only the announced pubkey.
+         identity-pubkeys
+         (into {}
+               (for [role roles
+                     :let [conn (get connections-by-role role)
+                           hs   (party/recv-handshake! conn handshake-timeout-ms)]]
+                 [role (:identity/pubkey-hex hs)]))]
      (log/log! {:level :info
                 :id    :mpc-multi-signature.orchestrator.core/started
                 :msg   "Orchestrator started"
                 :data  {:roles (vec roles) :bb-task bb-task
                         :participant-ids participant-ids
+                        :identity-pubkeys identity-pubkeys
                         :working-dir wd}})
      {:connections-by-role connections-by-role
       :participant-ids     participant-ids
-      :identity-keypairs   identity-keypairs
+      :identity-pubkeys    identity-pubkeys
       :working-dir         wd})))
 
 (defn keygen
@@ -109,14 +121,6 @@
    :share-handle and :challenge-context-hex."
   [orch participants opts]
   (ceremony/run-share-possession-proof orch participants opts))
-
-(defn- identity-public-key-bytes
-  "Get a role's Ed25519 identity public key bytes (32-byte raw)."
-  [{:keys [identity-keypairs]} role]
-  (let [kp (get identity-keypairs role)]
-    (when-not kp
-      (throw (ex-info (str "no identity key for role " role) {:role role})))
-    (:x kp)))
 
 (defn- bind-context
   "Compute the per-party bound challenge context for an identity-share
@@ -279,7 +283,7 @@
      :per-party  per}))
 
 ;; ============================================================
-;; Identity-share binding proof (Stage 5a part-2)
+;; Identity-share binding proof (Stage 5a; bb-wrapper-side as of 5b.2)
 ;; ============================================================
 ;;
 ;; Welds an Ed25519 identity key to its MPC share via two checks:
@@ -288,14 +292,21 @@
 ;;   2. Ed25519 signature over the PoK transcript binds the identity
 ;;      holder to the proof.
 ;;
-;; HARNESS-ONLY placement: orchestrator holds the Ed25519 keypairs.
-;; Production refactor: keys belong at the bb wrapper (each party
-;; holds its own private key); orchestrator only sees public keys.
-;; The cryptographic structure is identical either way.
+;; Stage 5b.2 placement: each party holds its own Ed25519 private key
+;; at the bb wrapper. The orchestrator never sees private keys; it
+;; passes :binding-mode? true into the share-possession-proof
+;; ceremony, the bb wrapper signs the proof bytes locally after
+;; crypto-core emits them, and the augmented transcript flows back
+;; through the normal ceremony-complete path.
 
 (defn binding-share-possession-proof
   "Run a share-possession proof bound to each party's Ed25519 identity
-   key. Returns:
+   key. The orchestrator computes per-party bound challenge contexts
+   ctx_r = SHA-256(verifier-nonce || K_id_pub_r) using the pubkeys
+   each bb wrapper announced at startup; the binding signature itself
+   is produced by each bb wrapper during the ceremony.
+
+   Returns:
      {:proofs {role {:verification-share-hex ...
                      :proof-hex ...
                      :challenge-context-hex ... (the bound context)
@@ -303,36 +314,30 @@
                      :identity-signature-hex ...}}
       :verifier-nonce-hex <hex>
       :ceremony/id <uuid>}"
-  [{:keys [identity-keypairs] :as orch} participants
+  [{:keys [identity-pubkeys] :as orch} participants
    {:keys [share-handle verifier-nonce-hex deadline-ms]
     :or   {deadline-ms 30000}}]
   (assert share-handle       "binding-share-possession-proof: :share-handle required")
   (assert verifier-nonce-hex "binding-share-possession-proof: :verifier-nonce-hex required")
   (let [nonce        (hex->bytes verifier-nonce-hex)
-        ;; Per-party bound contexts: ctx_r = SHA-256(nonce || K_id_pub_r)
         ctx-by-role  (into {}
                            (for [r participants
-                                 :let [pub (identity-public-key-bytes orch r)]]
+                                 :let [pub-hex (or (get identity-pubkeys r)
+                                                   (throw (ex-info (str "no identity pubkey for role " r)
+                                                                   {:role r})))
+                                       pub     (hex->bytes pub-hex)]]
                              [r (bytes->hex (bind-context nonce pub))]))
         proof-result (ceremony/run-share-possession-proof
                       orch participants
                       {:share-handle                  share-handle
                        :challenge-context-hex-by-role ctx-by-role
+                       :binding-mode?                 true
                        :deadline-ms                   deadline-ms})]
     (when (:error proof-result)
       (throw (ex-info "share-possession-proof failed" proof-result)))
-    (let [signet-sign (requiring-resolve 'signet.sign/sign)
-          augmented   (into {}
-                            (for [[r party-proof] (:proofs proof-result)
-                                  :let [kp          (get identity-keypairs r)
-                                        proof-bytes (hex->bytes (:proof-hex party-proof))
-                                        sig-bytes   (signet-sign kp proof-bytes)]]
-                              [r (assoc party-proof
-                                        :identity-pubkey-hex    (bytes->hex (:x kp))
-                                        :identity-signature-hex (bytes->hex sig-bytes))]))]
-      {:proofs             augmented
-       :verifier-nonce-hex verifier-nonce-hex
-       :ceremony/id        (:ceremony/id proof-result)})))
+    {:proofs             (:proofs proof-result)
+     :verifier-nonce-hex verifier-nonce-hex
+     :ceremony/id        (:ceremony/id proof-result)}))
 
 (defn verify-binding-share-proof
   "Verify a single party's identity-share binding proof:
@@ -359,19 +364,21 @@
 
 (defn verify-all-binding-share-proofs
   "Verify every party's identity-share binding proof against the
-   orchestrator's registered identity public keys + the verification
-   shares from a prior keygen.
+   orchestrator's registered identity public keys (announced by each
+   bb wrapper at startup) + the verification shares from a prior
+   keygen.
    Returns {:all-valid? bool :per-party {role bool}}"
   [orch proof-result keygen-result]
-  (let [vshares (:verification-shares keygen-result)
-        ids     (:identity-keypairs orch)
-        per     (into {}
-                      (for [[r party-proof] (:proofs proof-result)
-                            :let [registered-id-hex (bytes->hex (:x (get ids r)))
-                                  vshare-match?     (= (:verification-share-hex party-proof)
-                                                       (get vshares r))]]
-                        [r (and vshare-match?
-                                (verify-binding-share-proof registered-id-hex party-proof))]))]
+  (let [vshares  (:verification-shares keygen-result)
+        pubkeys  (:identity-pubkeys orch)
+        per      (into {}
+                       (for [[r party-proof] (:proofs proof-result)
+                             :let [registered-id-hex (get pubkeys r)
+                                   vshare-match?     (= (:verification-share-hex party-proof)
+                                                        (get vshares r))]]
+                         [r (and registered-id-hex
+                                 vshare-match?
+                                 (verify-binding-share-proof registered-id-hex party-proof))]))]
     {:all-valid? (every? true? (vals per))
      :per-party  per}))
 

@@ -37,13 +37,18 @@
 ;;     auditor — can each check the same transcripts under their own
 ;;     trust assumptions.)
 ;;
-;;   - Identity-share binding mode. When the verifier supplies per-
+;;   - Identity-share binding mode. When the begin event carries
+;;     :ceremony/binding-mode? true and the verifier supplies per-
 ;;     party challenge contexts of the form ctx_r = H(verifier-nonce
-;;     || K_id_pub_r), and additionally requires each party's Ed25519
-;;     signature over its Schnorr transcript, the ceremony produces
-;;     an identity-share binding proof. This is composition (the
-;;     binding signature is added by the orchestrator wrapper after
-;;     :state/complete), not a structural change to the chart.
+;;     || K_id_pub_r), each party additionally signs its Schnorr
+;;     proof bytes with its own Ed25519 identity key during
+;;     :state/running, before emitting :event/ceremony-complete. The
+;;     transcript that flows back to the orchestrator therefore
+;;     already carries the binding signature; no orchestrator-side
+;;     post-processing is required. (Stage 5b.2 placement: identity
+;;     private keys live at the bb wrapper; the orchestrator only
+;;     sees public keys announced via the :party/identity handshake
+;;     at startup.)
 ;;
 ;; Convention: [event] denotes a transition trigger;
 ;;             {action} denotes an entry/exit action;
@@ -65,6 +70,7 @@
   :ceremony/deadline        :timestamp         ; default short (~30 s); proof is local compute
   :ceremony/share-handle    nil                ; opaque handle into the keygen-output store
   :ceremony/challenge-context :uniform-or-per-role ; verifier-supplied; either uniform or {role hex}
+  :ceremony/binding-mode?   false              ; if true, parties additionally sign their proof with their Ed25519 identity key
   :ceremony/per-party-state {}                 ; populated at :state/starting from :ceremony/participants
   :ceremony/transcripts     {}                 ; party -> :crypto/share-possession-transcript
   :ceremony/error           nil}
@@ -81,6 +87,7 @@
          :actions [:action/record-deadline
                    :action/record-share-handle
                    :action/record-challenge-context
+                   :action/record-binding-mode
                    :action/init-per-party-state]}
 
         :event/cancel
@@ -269,6 +276,16 @@
    where each party's context is bound to its Ed25519 identity public
    key)."
 
+  :action/record-binding-mode
+  "Capture :ceremony/binding-mode? from the begin-ceremony event
+   payload (defaults to false). When true, each party's bb wrapper
+   will sign the Schnorr proof bytes with its own Ed25519 identity
+   key during :state/running, before emitting
+   :event/ceremony-complete. The bb wrapper threads this flag through
+   to its rust-reader thread so :ceremony/complete results are
+   augmented with :result/identity-pubkey-hex and
+   :result/identity-signature-hex on the way back to the orchestrator."
+
   :action/init-per-party-state
   "Initialize :ceremony/per-party-state with one
    :party-state/awaiting entry per actor in :ceremony/participants.
@@ -308,10 +325,11 @@
                    :proof-hex ...
                    :challenge-context-hex ...}}
     :ceremony/id <uuid>}.
-   In identity-share binding mode the orchestrator wrapper augments
-   each per-party entry with :identity-pubkey-hex and
-   :identity-signature-hex AFTER the ceremony completes — that
-   composition is OUT OF SCOPE for this chart."
+   In identity-share binding mode each per-party entry additionally
+   carries :identity-pubkey-hex and :identity-signature-hex; those
+   were produced by the corresponding bb wrapper inside
+   :state/running and arrived here as part of the ceremony-complete
+   transcript, so the orchestrator does no post-processing."
 
   :action/notify-coordinator-success
   "Resolve the verifier's promise with the ceremony result."

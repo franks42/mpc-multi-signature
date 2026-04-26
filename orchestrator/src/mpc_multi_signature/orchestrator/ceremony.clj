@@ -408,7 +408,7 @@
    context, demonstrating possession of their share without producing
    a real signature.
 
-   Two modes:
+   Challenge-context modes:
      :challenge-context-hex <hex>
        Uniform challenge context; every party gets the same bytes.
      :challenge-context-hex-by-role {role <hex> ...}
@@ -416,13 +416,21 @@
        binding proofs (each party's context is bound to their own
        identity public key).
 
+   Optional :binding-mode? true (Stage 5b.2): instructs each bb
+   wrapper to additionally sign the Schnorr proof bytes with its own
+   Ed25519 identity key after crypto-core emits the transcript. The
+   per-party result then carries :result/identity-pubkey-hex and
+   :result/identity-signature-hex on top of the basic transcript.
+
    Result:
      {:proofs {role {:verification-share-hex ... :proof-hex ...
-                     :challenge-context-hex ...}}
+                     :challenge-context-hex ...
+                     :identity-pubkey-hex ... ; binding mode only
+                     :identity-signature-hex ...}} ; binding mode only
       :ceremony/id <uuid>}"
   [{:keys [participant-ids] :as orch} participants
    {:keys [share-handle challenge-context-hex challenge-context-hex-by-role
-           deadline-ms]
+           binding-mode? deadline-ms]
     :or   {deadline-ms 30000}}]
   (assert share-handle "run-share-possession-proof: :share-handle required")
   (assert (or challenge-context-hex challenge-context-hex-by-role)
@@ -434,18 +442,22 @@
                       (or (get challenge-context-hex-by-role me)
                           challenge-context-hex))
         make-begin  (fn [me]
-                      {:msg/type                       :ceremony/begin-share-proof
-                       :ceremony/id                    ceremony-id
-                       :ceremony/me                    me
-                       :ceremony/participant-ids       ids
-                       :ceremony/share-handle          share-handle
-                       :ceremony/challenge-context-hex (ctx-for me)})
+                      (cond-> {:msg/type                       :ceremony/begin-share-proof
+                               :ceremony/id                    ceremony-id
+                               :ceremony/me                    me
+                               :ceremony/participant-ids       ids
+                               :ceremony/share-handle          share-handle
+                               :ceremony/challenge-context-hex (ctx-for me)}
+                        binding-mode? (assoc :ceremony/binding-mode? true)))
         finalize    (fn [results]
                       {:passed? true
                        :result  {:proofs      (into {}
                                                     (for [[r m] results]
-                                                      [r {:verification-share-hex (:result/verification-share-hex m)
-                                                          :proof-hex              (:result/proof-hex m)
-                                                          :challenge-context-hex  (ctx-for r)}]))
+                                                      [r (cond-> {:verification-share-hex (:result/verification-share-hex m)
+                                                                  :proof-hex              (:result/proof-hex m)
+                                                                  :challenge-context-hex  (ctx-for r)}
+                                                           binding-mode?
+                                                           (assoc :identity-pubkey-hex    (:result/identity-pubkey-hex m)
+                                                                  :identity-signature-hex (:result/identity-signature-hex m)))]))
                                  :ceremony/id ceremony-id}})]
     (run-ceremony orch ceremony-id peers make-begin finalize deadline-ms)))
