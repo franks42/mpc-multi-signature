@@ -194,10 +194,16 @@
                        (let [check (keygen-consistency-check results)]
                          (if (:passed? check)
                            {:passed? true
-                            :result {:public-key   (:public-key check)
-                                     :share-handle share-handle
-                                     :handles      (into {} (for [r peers] [r share-handle]))
-                                     :ceremony/id  ceremony-id}}
+                            :result {:public-key          (:public-key check)
+                                     :share-handle        share-handle
+                                     :handles             (into {} (for [r peers] [r share-handle]))
+                                     ;; Per-party verification shares —
+                                     ;; the X_i = x_i·G commitment used
+                                     ;; by Stage 5+ share-possession proofs.
+                                     :verification-shares (into {}
+                                                                (for [[r m] results]
+                                                                  [r (:result/verification-share-hex m)]))
+                                     :ceremony/id         ceremony-id}}
                            {:passed? false :reason (:reason check) :details check})))]
     (run-ceremony orch ceremony-id peers make-begin finalize deadline-ms)))
 
@@ -380,11 +386,54 @@
                                         results public-key-hex)]
                              (if (:passed? check)
                                {:passed? true
-                                :result {:public-key   (:public-key check)
-                                         :share-handle new-share-handle
-                                         :handles      (into {}
-                                                             (for [r new-participants]
-                                                               [r new-share-handle]))
-                                         :ceremony/id  ceremony-id}}
+                                :result {:public-key          (:public-key check)
+                                         :share-handle        new-share-handle
+                                         :handles             (into {}
+                                                                    (for [r new-participants]
+                                                                      [r new-share-handle]))
+                                         ;; Refresh verification shares for the new shareset.
+                                         :verification-shares (into {}
+                                                                    (for [[r m] results]
+                                                                      [r (:result/verification-share-hex m)]))
+                                         :ceremony/id         ceremony-id}}
                                {:passed? false :reason (:reason check) :details check})))]
     (run-ceremony orch ceremony-id protocol-runners make-begin finalize deadline-ms)))
+
+;; ============================================================
+;; Stage 5a: share-possession proof
+;; ============================================================
+
+(defn run-share-possession-proof
+  "Each participating party produces a Schnorr PoK against a fresh
+   challenge context, demonstrating possession of their share without
+   producing a real signature. Result:
+     {:proofs {role {:verification-share-hex ... :proof-hex ...}}
+      :challenge-context-hex <hex>
+      :ceremony/id <uuid>}"
+  [{:keys [participant-ids] :as orch} participants
+   {:keys [share-handle challenge-context-hex deadline-ms]
+    :or   {deadline-ms 30000}}]
+  (assert share-handle          "run-share-possession-proof: :share-handle required")
+  (assert challenge-context-hex "run-share-possession-proof: :challenge-context-hex required")
+  (let [ceremony-id (uuidv7/uuidv7)
+        peers       (vec participants)
+        ids         (select-keys participant-ids peers)
+        make-begin  (fn [me]
+                      {:msg/type                      :ceremony/begin-share-proof
+                       :ceremony/id                   ceremony-id
+                       :ceremony/me                   me
+                       :ceremony/participant-ids      ids
+                       :ceremony/share-handle         share-handle
+                       :ceremony/challenge-context-hex challenge-context-hex})
+        finalize    (fn [results]
+                      ;; Each participant returns their proof + verification share.
+                      ;; No cross-party consistency required (each party's PoK is
+                      ;; independent); the orchestrator will verify each separately.
+                      {:passed? true
+                       :result  {:proofs                 (into {}
+                                                               (for [[r m] results]
+                                                                 [r {:verification-share-hex (:result/verification-share-hex m)
+                                                                     :proof-hex             (:result/proof-hex m)}]))
+                                 :challenge-context-hex  challenge-context-hex
+                                 :ceremony/id            ceremony-id}})]
+    (run-ceremony orch ceremony-id peers make-begin finalize deadline-ms)))

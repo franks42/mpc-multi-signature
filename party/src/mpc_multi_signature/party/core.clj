@@ -149,15 +149,25 @@
    :public_key_hex  public-key-hex
    :new_share_path  (artifact-path me "shares" new-share-handle)})
 
+(defn- begin-share-proof->json
+  [{:keys [:ceremony/id :ceremony/me :ceremony/share-handle
+           :ceremony/challenge-context-hex :ceremony/participant-ids]}]
+  {:msg_type              "begin_share_proof"
+   :ceremony_id           (str id)
+   :me                    (get participant-ids me)
+   :share_path            (artifact-path me "shares" share-handle)
+   :challenge_context_hex challenge-context-hex})
+
 (defn- begin->json
   "Dispatch on :msg/type to the appropriate translator."
   [msg]
   (case (:msg/type msg)
-    :ceremony/begin-keygen   (begin-keygen->json msg)
-    :ceremony/begin-triples  (begin-triples->json msg)
-    :ceremony/begin-presign  (begin-presign->json msg)
-    :ceremony/begin-sign     (begin-sign->json msg)
-    :ceremony/begin-reshare  (begin-reshare->json msg)
+    :ceremony/begin-keygen      (begin-keygen->json msg)
+    :ceremony/begin-triples     (begin-triples->json msg)
+    :ceremony/begin-presign     (begin-presign->json msg)
+    :ceremony/begin-sign        (begin-sign->json msg)
+    :ceremony/begin-reshare     (begin-reshare->json msg)
+    :ceremony/begin-share-proof (begin-share-proof->json msg)
     (throw (ex-info "Unknown begin-* message type" {:type (:msg/type msg)}))))
 
 (defn- ceremony-participant-ids
@@ -327,7 +337,7 @@
 
 (def ^:private begin-types
   #{:ceremony/begin-keygen :ceremony/begin-triples :ceremony/begin-presign
-    :ceremony/begin-sign   :ceremony/begin-reshare})
+    :ceremony/begin-sign   :ceremony/begin-reshare :ceremony/begin-share-proof})
 
 (defn -main [& args]
   (let [{:keys [role]} (parse-args args)]

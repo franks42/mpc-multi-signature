@@ -94,6 +94,12 @@
   [orch opts]
   (ceremony/run-reshare orch opts))
 
+(defn share-possession-proof
+  "Run a share-possession proof ceremony. `opts` requires
+   :share-handle and :challenge-context-hex."
+  [orch participants opts]
+  (ceremony/run-share-possession-proof orch participants opts))
+
 ;; ============================================================
 ;; High-level: canonicalize an EDN payload, sign, cross-verify
 ;; ============================================================
@@ -158,6 +164,92 @@
         sig-bytes    (hex->bytes sig-hex)
         digest-bytes (hex->bytes digest-hex)]
     (jca-secp256k1-verify-digest pub-bytes digest-bytes sig-bytes)))
+
+;; ============================================================
+;; Schnorr PoK verifier (Stage 5a — share-possession proof)
+;; ============================================================
+;;
+;; Verifies a transcript produced by crypto-core's schnorr_pok_share.
+;; Math: given X_i (verification share), R (compressed point), s
+;; (scalar), and the verifier-supplied challenge_context, recompute
+;; c = SHA-256(R || X_i || context) and check s·G == R + c·X_i.
+;;
+;; Implementation uses BC's secp256k1 curve parameters via reflection
+;; (BC is on classpath via signet 0.4.0). Independent of both the
+;; threshold-signatures crate and our crypto-core's Rust prover —
+;; genuine cross-validation.
+
+(defn- bc-secp256k1-params
+  "Lazy-resolve BC's secp256k1 ECNamedCurveParameterSpec via reflection
+   so we don't trigger BC class loading at namespace load time
+   (which would break bb compatibility for unrelated paths)."
+  []
+  (let [cls (Class/forName "org.bouncycastle.jce.ECNamedCurveTable")
+        m   (.getMethod cls "getParameterSpec" (into-array Class [String]))]
+    (.invoke m nil (into-array Object ["secp256k1"]))))
+
+(defn- decode-point [params ^bytes compressed]
+  (.decodePoint (.getCurve params) compressed))
+
+(defn- verify-share-pok
+  "Returns true iff the Schnorr PoK transcript verifies against the
+   given verification share and challenge context. Never throws on
+   malformed inputs — returns false."
+  [^bytes vshare-bytes ^bytes proof-bytes ^bytes challenge-context]
+  (try
+    (when-not (and (= 33 (count vshare-bytes))
+                   (= 65 (count proof-bytes)))
+      (throw (ex-info "bad input lengths" {})))
+    (let [r-bytes (java.util.Arrays/copyOfRange proof-bytes 0 33)
+          s-bytes (java.util.Arrays/copyOfRange proof-bytes 33 65)
+          params  (bc-secp256k1-params)
+          big-r   (decode-point params r-bytes)
+          big-x   (decode-point params vshare-bytes)
+          c-digest (let [md (java.security.MessageDigest/getInstance "SHA-256")]
+                     (.update md r-bytes)
+                     (.update md vshare-bytes)
+                     (.update md challenge-context)
+                     (.digest md))
+          n        (.getN params)
+          c        (-> (java.math.BigInteger. 1 c-digest) (.mod n))
+          s        (-> (java.math.BigInteger. 1 s-bytes) (.mod n))
+          g        (.getG params)
+          ;; Check  s·G == R + c·X_i.
+          s-g      (-> (.multiply g s) .normalize)
+          c-x      (.multiply big-x c)
+          rhs      (-> (.add big-r c-x) .normalize)]
+      (and (= (.getAffineXCoord s-g) (.getAffineXCoord rhs))
+           (= (.getAffineYCoord s-g) (.getAffineYCoord rhs))))
+    (catch Exception _ false)))
+
+(defn verify-share-possession-proof
+  "Verify a single party's share-possession proof.
+     vshare-hex          — 33-byte sec1 compressed verification share (hex)
+     proof-hex           — 65-byte Schnorr transcript (R || s) (hex)
+     challenge-context-hex — verifier-supplied bytes the proof was bound to"
+  [vshare-hex proof-hex challenge-context-hex]
+  (verify-share-pok (hex->bytes vshare-hex)
+                    (hex->bytes proof-hex)
+                    (hex->bytes challenge-context-hex)))
+
+(defn verify-all-share-proofs
+  "Given the result map from `share-possession-proof` and the
+   per-party verification shares from a prior keygen, verify every
+   party's PoK. Also checks that the verification share each party
+   reported in their proof matches what keygen recorded — catches
+   parties who tried to swap their X_i.
+
+   Returns {:all-valid? bool :per-party {role bool}}"
+  [proof-result keygen-result]
+  (let [vshares (:verification-shares keygen-result)
+        ctx-hex (:challenge-context-hex proof-result)
+        proofs  (:proofs proof-result)
+        per     (into {} (for [[r {:keys [verification-share-hex proof-hex]}] proofs]
+                           [r (and (= verification-share-hex (get vshares r))
+                                   (verify-share-possession-proof
+                                    verification-share-hex proof-hex ctx-hex))]))]
+    {:all-valid? (every? true? (vals per))
+     :per-party  per}))
 
 (defn sign-edn-message
   "High-level sign: take an EDN payload, canonicalize, hash, drive the

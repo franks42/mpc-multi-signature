@@ -48,7 +48,7 @@ use sha2::{Digest, Sha256};
 
 use elliptic_curve::ff::PrimeField;
 use elliptic_curve::sec1::ToEncodedPoint;
-use k256::AffinePoint;
+use k256::{AffinePoint, ProjectivePoint};
 
 use threshold_signatures::{
     ecdsa::{
@@ -115,6 +115,16 @@ enum Inbound {
         old_share_path: Option<String>,
         public_key_hex: String,
         new_share_path: String,
+    },
+    BeginShareProof {
+        ceremony_id: String,
+        me: u32,
+        share_path: String,
+        /// Hex-encoded bytes that the verifier supplies to bind the
+        /// proof to a specific context — verifier nonce, ceremony id,
+        /// ceremony purpose, etc. The Fiat-Shamir hash includes this
+        /// verbatim so the proof is non-replayable across contexts.
+        challenge_context_hex: String,
     },
     ProtocolDeliver {
         ceremony_id: String,
@@ -258,6 +268,24 @@ fn drive_protocol<T>(
     }
 }
 
+// ---------- Per-party verification share ----------
+//
+// X_i = x_i · G — the public commitment to a share's secret scalar.
+// frost-core's SigningShare<C> is a tuple wrapping the inner scalar;
+// .to_scalar() returns it. We multiply by secp256k1's generator and
+// emit 33-byte sec1 compressed bytes — what verifiers compare
+// against in Schnorr-PoK share-possession proofs.
+fn verification_share_compressed(out: &KeygenOutput<Secp256K1Sha256>) -> [u8; 33] {
+    let scalar_secp: EcdsaScalar = out.private_share.to_scalar();
+    let big_x: ProjectivePoint = ProjectivePoint::GENERATOR * scalar_secp;
+    let big_x_affine: AffinePoint = big_x.to_affine();
+    let encoded = big_x_affine.to_encoded_point(true);
+    let bytes = encoded.as_bytes();
+    let mut buf = [0u8; 33];
+    buf.copy_from_slice(bytes);
+    buf
+}
+
 // ---------- Ceremony handlers ----------
 
 fn handle_keygen(
@@ -284,6 +312,7 @@ fn handle_keygen(
 
     let pk_bytes = out.public_key.serialize().map_err(|e| anyhow!("{:?}", e))?;
     let pk_hex = hex::encode(&pk_bytes);
+    let vshare_hex = hex::encode(verification_share_compressed(&out));
     let share_bytes = rmp_serde::to_vec_named(&out).context("rmp-serde encode KeygenOutput")?;
     let fp = sha256_hex(&share_bytes);
     write_blob(&share_path, &share_bytes)?;
@@ -294,9 +323,10 @@ fn handle_keygen(
         &Outbound::CeremonyComplete {
             ceremony_id,
             result: serde_json::json!({
-                "public_key_hex":  pk_hex,
-                "share_fingerprint": fp,
-                "share_path": share_path,
+                "public_key_hex":         pk_hex,
+                "verification_share_hex": vshare_hex,
+                "share_fingerprint":      fp,
+                "share_path":             share_path,
             }),
         },
     )?;
@@ -575,6 +605,7 @@ fn handle_reshare(
 
     let new_pk_bytes = new_kg.public_key.serialize().map_err(|e| anyhow!("{:?}", e))?;
     let new_pk_hex = hex::encode(&new_pk_bytes);
+    let new_vshare_hex = hex::encode(verification_share_compressed(&new_kg));
     let bytes = rmp_serde::to_vec_named(&new_kg).context("rmp-serde encode KeygenOutput")?;
     let fp = sha256_hex(&bytes);
     write_blob(&new_share_path, &bytes)?;
@@ -592,13 +623,130 @@ fn handle_reshare(
         &Outbound::CeremonyComplete {
             ceremony_id,
             result: serde_json::json!({
-                "public_key_hex": new_pk_hex,
-                "share_fingerprint": fp,
-                "share_path": new_share_path,
+                "public_key_hex":         new_pk_hex,
+                "verification_share_hex": new_vshare_hex,
+                "share_fingerprint":      fp,
+                "share_path":             new_share_path,
             }),
         },
     )?;
     Ok(())
+}
+
+// ---------- Share-possession proof handler ----------
+
+fn handle_share_proof(
+    role: &str,
+    ceremony_id: String,
+    _me: u32,
+    share_path: String,
+    challenge_context_hex: String,
+    stdout: &mut io::StdoutLock<'_>,
+) -> Result<()> {
+    let keygen_bytes = read_blob(&share_path)?;
+    let keygen_out: KeygenOutput<Secp256K1Sha256> =
+        rmp_serde::from_slice(&keygen_bytes).context("decode KeygenOutput")?;
+
+    let challenge_context =
+        hex::decode(&challenge_context_hex).context("decode challenge_context_hex")?;
+
+    let x_i: EcdsaScalar = keygen_out.private_share.to_scalar();
+    let big_x_compressed = verification_share_compressed(&keygen_out);
+
+    let transcript = schnorr_pok_share(&x_i, &big_x_compressed, &challenge_context);
+
+    log_stderr(role, "share-possession proof produced");
+    write_outbound(
+        stdout,
+        &Outbound::CeremonyComplete {
+            ceremony_id,
+            result: serde_json::json!({
+                "verification_share_hex": hex::encode(big_x_compressed),
+                "proof_hex":              hex::encode(transcript),
+            }),
+        },
+    )?;
+    Ok(())
+}
+
+// ---------- Schnorr proof of knowledge of share x_i ----------
+//
+// Public input:  X_i = x_i · G    (33-byte compressed; the verifier
+//                                   already has this from keygen)
+//                challenge_context (verifier-supplied bytes —
+//                                   nonce, ceremony id, identity-key
+//                                   binding, etc.)
+// Private input: x_i               (the share scalar, loaded from disk)
+//
+// Proof:
+//   pick r ← Z_n
+//   R = r · G
+//   c = SHA-256(R_compressed || X_i_compressed || challenge_context)
+//   s = r + c · x_i mod n
+//   transcript = (R_compressed, s_bytes)         33 + 32 = 65 bytes raw
+//
+// Verification (orchestrator side):
+//   recompute c from received R_compressed + X_i + context
+//   check  s · G == R + c · X_i
+//
+// The challenge context is the binding mechanism: Stage 5a uses it
+// for verifier-nonce + ceremony-id; Stage 5a's identity-binding
+// extension layers in the Ed25519 identity public key.
+
+fn schnorr_pok_share(
+    x_i: &EcdsaScalar,
+    big_x_compressed: &[u8; 33],
+    challenge_context: &[u8],
+) -> [u8; 65] {
+    use rand_core::RngCore;
+
+    // 1. r ← Z_n.
+    //    rand_core 0.6 + k256 0.13 don't expose a one-call
+    //    "random_nonzero scalar" without extra plumbing; we sample
+    //    32 bytes and reduce, retrying on the rare zero result.
+    let r: EcdsaScalar = loop {
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        if let Some(s) = EcdsaScalar::from_repr(bytes.into()).into_option() {
+            if !bool::from(s.is_zero()) {
+                break s;
+            }
+        }
+    };
+
+    // 2. R = r · G.
+    let big_r = ProjectivePoint::GENERATOR * r;
+    let big_r_affine = big_r.to_affine();
+    let big_r_encoded = big_r_affine.to_encoded_point(true);
+    let big_r_compressed: [u8; 33] = {
+        let mut buf = [0u8; 33];
+        buf.copy_from_slice(big_r_encoded.as_bytes());
+        buf
+    };
+
+    // 3. c = SHA-256(R || X_i || context).
+    let mut hasher = Sha256::new();
+    hasher.update(big_r_compressed);
+    hasher.update(big_x_compressed);
+    hasher.update(challenge_context);
+    let c_digest = hasher.finalize();
+
+    // Reduce SHA-256 output mod n. For secp256k1 this is well-defined:
+    // map 32 bytes → scalar via from_repr; on the rare overflow case
+    // (probability ~2^-128) the protocol allows fallback.
+    let c: EcdsaScalar = EcdsaScalar::from_repr(c_digest.into())
+        .into_option()
+        .unwrap_or(EcdsaScalar::ZERO);
+
+    // 4. s = r + c · x_i.
+    let s: EcdsaScalar = r + c * x_i;
+    let s_repr: [u8; 32] = s.to_repr().into();
+
+    // 5. Pack transcript: R || s.
+    let mut out = [0u8; 65];
+    out[..33].copy_from_slice(&big_r_compressed);
+    out[33..].copy_from_slice(&s_repr);
+    out
 }
 
 // ---------- secp256k1 x-coordinate helper ----------
@@ -753,6 +901,20 @@ fn main() -> Result<()> {
             public_key_hex,
             new_share_path,
             &mut stdin_lock,
+            &mut stdout_lock,
+        ),
+
+        Inbound::BeginShareProof {
+            ceremony_id,
+            me,
+            share_path,
+            challenge_context_hex,
+        } => handle_share_proof(
+            &role,
+            ceremony_id,
+            me,
+            share_path,
+            challenge_context_hex,
             &mut stdout_lock,
         ),
 
