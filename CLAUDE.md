@@ -119,8 +119,8 @@ independently.
 ## Implementation plan — staged
 
 The plan is in `docs/recovery-exploration-harness-design.md` under
-"Implementation plan". **Stages 0 through 4 are done as of
-2026-04-26**; Stage 5 is next.
+"Implementation plan". **Stages 0 through 5a are done as of
+2026-04-26**; Stage 5b is next.
 
 Status at a glance:
 
@@ -129,7 +129,7 @@ Status at a glance:
   (`statechart-keygen.edn`, `statechart-sign.edn`,
   `statechart-reshare-recovery.edn`). Remaining: divorce, refresh,
   attestation-issuance, triple-generation, presign,
-  share-possession-proof. Stage 5 work likely needs charts for some
+  share-possession-proof. Stage 5+ work likely needs charts for some
   of these.
 - **Stage 1 (done)** — null orchestrator + three null parties round-
   tripping a stubbed `:keygen` ceremony in EDN. Tag
@@ -144,13 +144,35 @@ Status at a glance:
   member-change → sign with new shareset → independent cross-verify
   via signet/BC against the original public key. Tag
   `v0.4.0-stage-4-uc2-complete`.
-- **Stage 5 (next)** — production-readiness primitives + business
-  logic. See `docs/recovery-exploration-harness-design.md`
-  Appendix E (confidentiality/transport) and Appendix F
-  (share-possession + identity-share binding proofs) for the
-  architectural decisions captured during Stage 4. The traditional
-  Stage 5 scope (commitment registries, attestation services,
-  recovery policy gates) sits on top.
+- **Stage 5a (done)** — share-possession + identity-share binding
+  proofs (per design doc Appendix F). Schnorr PoK on each party's
+  verification share `X_i = x_i·G` welded to their Ed25519 identity
+  via bound challenge context + Ed25519 signature over the
+  transcript. Independent BC-based verifier in pure Clojure.
+  Tag `v0.5.0-stage-5a-share-possession-binding`. Concrete signal:
+  every party now has a cryptographically welded identity-share
+  pairing — the trust foundation for everything downstream.
+- **Stage 5b (next)** — transport hardening (per design doc
+  Appendix E): Noise XK session layer in the bb wrapper using
+  signet 0.5.0's `encryption/box`+`unbox` primitives, AEAD-wrapping
+  protocol_private bodies before they leave the party; plus
+  encryption-at-rest for `<role>/{shares,triples,presigs}/<handle>.bin`
+  files; plus migrating Stage 5a's Ed25519 identity keys from the
+  orchestrator (current harness placement) to the bb wrapper
+  (production placement).
+- **Stage 5c (after)** — traditional business-logic scope:
+  commitment registries, commitment-gated reshare,
+  publication/objection windows, multi-party authorization gates for
+  recovery, attestation-issuance ceremonies (KYC TAS, commitment
+  TAS, social recovery TAS).
+
+Stage 5b prerequisites already shipped: **signet 0.5.0** (in `~/.m2`
++ `github.com/franks42/signet` tag `v0.5.0`) provides
+`signet.encryption/box` and `unbox` — sender-authenticated AEAD
+(X25519 DH → HKDF-SHA-256 → ChaCha20-Poly1305). JCA-only,
+bb-compatible. Auto-converts Ed25519 keypairs so the same identity
+keys provisioned in Stage 5a drop straight into transport
+encryption with no separate key plumbing.
 
 Architecture invariants locked in Stages 1–4 (carry forward):
 
@@ -372,35 +394,35 @@ because they distinguished "verified" from "expected" from
 
 ## Stage 5 entry points
 
-Stages 0–4 are done. The harness now runs the UC2 high-water-mark
-end-to-end (keygen → reshare with member change → sign with new
-shareset → independent cross-verify via signet/BC against the
-original public key, ~3.3 s wall time). What's next:
-
-**Stage 5a — share-possession + identity-share binding proofs**
-(per design doc Appendix F). Small primitive (~80 LOC across
-crypto-core + orchestrator), large architectural payoff. Should land
-before any business-logic work because the binding proof is the
-foundational ceremony-handshake authenticator. Depends on the
-threshold-signatures crate's per-party `VerifyingShare` being
-propagated through `crypto-core`'s keygen result up to the
-orchestrator's `:state/address-policy-registry` entry.
-
-**signet 0.5.0 — encryption layer** (in the sibling project
-`../signet`, recorded in memory tagged `signet,encryption,planned-
-enhancement`). signet currently has X25519 keys + raw Diffie–Hellman
-but no symmetric encryption primitive. Add `signet.encryption/box`
-+ `unbox` (sender-authenticated AEAD) using ChaCha20-Poly1305 via
-JCA. Bb-compatible (no BouncyCastle needed for symmetric crypto).
-~150–200 LOC. The user's standing preference is "enhance signet
-before mpc-multi-signature needs it" — same pattern that shipped
-secp256k1 in signet 0.4.0 before Stage 4 needed it.
+Stages 0–5a are done. The harness runs UC2 end-to-end (keygen →
+reshare with member change → sign with new shareset → independent
+cross-verify via signet/BC against the original public key, ~3.3s
+wall time) and Stage 5a's share-possession + identity-share binding
+proofs are in place — every party has a cryptographically welded
+identity-share pairing, the trust foundation for everything
+downstream. **signet 0.5.0** with the encryption layer is also
+shipped to `~/.m2` + `github.com/franks42/signet`. What's next:
 
 **Stage 5b — transport hardening** (per design doc Appendix E).
-Noise XK-pattern session layer in the bb wrapper, AEAD-wrapping
-`protocol_broadcast`/`protocol_private` bodies. Builds on signet
-0.5.0. Plus encryption-at-rest for `<role>/{shares,triples,presigs}`
-files (HSM/keyring/TEE backend behind the same handle-based API).
+Three sub-pieces:
+
+1. **Noise XK session layer in the bb wrapper.** At ceremony start,
+   peers run an authenticated key exchange using their Stage 5a
+   Ed25519 identity keys cross-converted to X25519 (signet's
+   birational map handles this). Per-message AEAD via
+   `signet.encryption/box` + `unbox` wrapping `protocol_private`
+   bodies before they leave the party; unwrap on receipt. The
+   orchestrator routes opaque AEAD-wrapped bytes; EDN contract
+   unchanged.
+2. **Migrate Stage 5a's Ed25519 identity keys from orchestrator to
+   bb wrapper** (production placement: each party holds its own
+   private key; orchestrator only sees public keys). Implementation:
+   env-var or configure-message at bb-wrapper startup. The
+   cryptographic structure is unchanged from Stage 5a; just plumbing.
+3. **Encryption-at-rest for `<role>/{shares,triples,presigs}/<handle>.bin`**
+   files at the bb-wrapper boundary. `<role, handle>` API stays
+   unchanged; storage backend swap (encrypt with party-local KEK
+   derived from Stage 5a identity keys, or plug in HSM/keyring/TEE).
 
 **Stage 5c — business logic.** The traditional Stage 5 scope:
 commitment registries (Figure-side), commitment-gated reshare,
