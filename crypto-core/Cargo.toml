@@ -1,0 +1,28 @@
+[package]
+name = "mpc-crypto-core"
+version = "0.1.0"
+edition = "2021"
+description = "MPC threshold-signature subprocess used by all three party-bbs."
+
+[[bin]]
+name = "mpc-crypto-core"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to a specific commit of near/mpc for reproducibility per the
+# feasibility-spike's recommendation. Bump deliberately; don't track main.
+threshold-signatures = { git = "https://github.com/near/mpc.git", rev = "a6e41e8" }
+
+# Serde for JSON-Lines wire format with the bb wrapper.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Base64 for binary protocol bodies inside JSON envelopes.
+base64 = "0.22"
+
+# RNG used by the threshold-signatures protocols.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Error helpers.
+anyhow = "1.0"
+thiserror = "1.0"

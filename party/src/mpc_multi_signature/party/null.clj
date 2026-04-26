@@ -62,10 +62,23 @@
              :data  {:role role :ceremony-id (:ceremony/id msg)}})
   nil)
 
+(defn- handle-protocol-deliver [role msg]
+  ;; Stage 2: null parties receive protocol-relay messages from real
+  ;; parties. They have no Protocol state to feed the bytes into, so
+  ;; they log and ignore. Real handling arrives at Stage 3 when this
+  ;; party is replaced by a bb-rust party.
+  (log/log! {:level :debug
+             :id    :mpc-multi-signature.party.null/protocol-deliver-ignored
+             :data  {:role role
+                     :ceremony-id (:ceremony/id msg)
+                     :from (:protocol/from msg)}})
+  nil)
+
 (defn- handle-message [role msg]
   (case (:msg/type msg)
     :ceremony/begin-keygen (handle-begin-keygen role msg)
-    :ceremony/cancel        (handle-cancel role msg)
+    :ceremony/cancel       (handle-cancel role msg)
+    :protocol/deliver      (handle-protocol-deliver role msg)
     (do (log/log! {:level :warn
                    :id    :mpc-multi-signature.party.null/unknown-message
                    :msg   "Unknown message type"

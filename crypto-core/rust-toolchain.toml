@@ -1,0 +1,7 @@
+[toolchain]
+# We don't depend on nearcore (the reason upstream near/mpc pins
+# 1.86.0), so we can use stable. Some transitive deps (darling 0.23,
+# serde_with 3.18) require >= 1.88.
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "default"

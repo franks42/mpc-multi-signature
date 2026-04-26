@@ -16,4 +16,15 @@
   null-party
   {:doc  "Run a null party stub. Args: --role <holder|figure|ic>"
    :task (apply (requiring-resolve 'mpc-multi-signature.party.null/-main)
-                *command-line-args*)}}}
+                *command-line-args*)}
+
+  bb-rust-party
+  {:doc  "Run a bb wrapper that spawns the crypto-core Rust subprocess.
+          Args: --role <holder|figure|ic>"
+   :task (apply (requiring-resolve 'mpc-multi-signature.party.bb-rust/-main)
+                *command-line-args*)}
+
+  build-crypto-core
+  {:doc  "cargo build crypto-core. Pass --release for release build."
+   :task (apply shell {:dir "crypto-core"}
+                "cargo" "build" *command-line-args*)}}}

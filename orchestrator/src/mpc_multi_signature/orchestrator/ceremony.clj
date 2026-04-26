@@ -33,13 +33,40 @@
                   :ceremony/threshold  threshold
                   :ceremony/scheme     :ecdsa/secp256k1-ot-based})))
 
+(defn- channel->role [connections-by-role ch]
+  (some (fn [[r conn]] (when (identical? ch (:inbound conn)) r))
+        connections-by-role))
+
+(defn- route-protocol-message!
+  "Statechart action :action/route-message. Forwards a
+   :protocol/broadcast (to every other participant) or :protocol/private
+   (to the named recipient) as a :protocol/deliver carrying the same
+   base64 body. The orchestrator never decodes protocol bodies."
+  [connections-by-role participants msg from-role]
+  (let [deliver {:msg/type      :protocol/deliver
+                 :ceremony/id   (:ceremony/id msg)
+                 :protocol/from from-role
+                 :protocol/body (:protocol/body msg)}]
+    (case (:msg/type msg)
+      :protocol/broadcast
+      (doseq [r participants
+              :when (not= r from-role)
+              :let  [conn (get connections-by-role r)]
+              :when conn]
+        (party/send! conn deliver))
+
+      :protocol/private
+      (when-let [conn (get connections-by-role (:protocol/to msg))]
+        (party/send! conn deliver)))))
+
 (defn- await-completes
   "Block until each participant emits :ceremony/complete or the deadline
-   elapses. Returns {:results {role result-map}} on success or
-   {:error :reason/timeout :missing #{...}} on timeout.
+   elapses. Routes :protocol/broadcast and :protocol/private messages
+   between parties as :protocol/deliver while waiting.
 
-   Uses alts!! across the participants' inbound channels and a single
-   timer channel. A late-arriving message after timeout is dropped per
+   Returns {:results {role result-map}} on success or
+   {:error :reason/timeout :missing #{...}} on timeout. Late-arriving
+   messages from a party already in :party-state/done are dropped per
    the chart's :late-protocol-message-after-final cross-cutting rule."
   [connections-by-role participants deadline-ms]
   (let [timer (a/timeout deadline-ms)
@@ -53,23 +80,30 @@
             (= ch timer)
             {:error :reason/timeout :missing pending :results results}
 
-            (nil? v) ; channel closed (party died)
+            (nil? v)
             {:error :reason/party-disconnected :missing pending :results results}
 
             (= :ceremony/complete (:msg/type v))
-            (let [role (some (fn [r]
-                               (when (identical? ch (get-in connections-by-role [r :inbound]))
-                                 r))
-                             pending)]
-              (if role
+            (let [role (channel->role connections-by-role ch)]
+              (if (contains? pending role)
                 (recur (disj pending role)
                        (assoc results role (:ceremony/result v)))
-                ;; Message from a role not in pending — protocol violation per chart.
                 {:error :reason/duplicate-complete :results results}))
 
+            (#{:protocol/broadcast :protocol/private} (:msg/type v))
+            (let [from-role (channel->role connections-by-role ch)]
+              (route-protocol-message! connections-by-role participants v from-role)
+              (recur pending results))
+
+            (= :ceremony/error (:msg/type v))
+            (let [from-role (channel->role connections-by-role ch)
+                  err       (:ceremony/error v)]
+              {:error   (:category err :reason/party-error)
+               :message (:message err)
+               :from    from-role
+               :results results})
+
             :else
-            ;; Stage 1: any non-:ceremony/complete message in :state/running
-            ;; is unexpected. Stages 2+ will route :protocol/* here.
             (recur pending results)))))))
 
 (defn- keygen-consistency-check
