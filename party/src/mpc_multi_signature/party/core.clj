@@ -5,28 +5,30 @@
    Rust subprocess).
 
    EDN↔JSON translation rules per design doc Appendix B:
-   - `:msg/type :ceremony/begin-keygen` ⇄ `\"msg_type\": \"begin_keygen\"`
+   - `:msg/type :ceremony/begin-X` ⇄ `\"msg_type\": \"begin_x\"`
      (namespace+name joined by `_`; hyphens become underscores)
    - Role/actor keywords ⇄ integer participant ids on the JSON side.
      The mapping is established from `:ceremony/peers` order in the
-     begin-keygen message and held for the ceremony's duration.
+     begin message and held for the ceremony's duration.
    - UUIDs become strings on the JSON side; orchestrator side gets EDN
      `#uuid \"...\"`.
    - Binary protocol bodies stay base64 strings on both sides; this
      wrapper does not decode them.
+   - Per-party file paths (shares, triples, presignatures) are
+     computed locally from (role, handle, artifact-kind) — orchestrator
+     supplies handles, bb wrapper supplies paths.
 
-   Stage 3 scope: keygen end-to-end with real shares and persistence.
-   Sign and reshare arrive in later stages."
+   Stage 4 scope: keygen + triples + presign + sign + reshare."
   (:require [cheshire.core :as json]
             [clojure.edn :as edn]
-            [com.github.franks42.uuidv7.core :as uuidv7]
+            [clojure.string :as str]
             [taoensso.timbre :as timbre]
             [taoensso.trove :as log]
             [taoensso.trove.timbre :as backend])
   (:import (java.io BufferedReader BufferedWriter PushbackReader)
            (java.lang ProcessBuilder ProcessBuilder$Redirect)))
 
-;; ---- telemetry init (mirrors null.clj) ----
+;; ---- telemetry init ----
 
 (defn- init-telemetry! [role]
   (timbre/merge-config!
@@ -56,14 +58,20 @@
 (defn- id->role-map [peers]
   (into {} (map-indexed (fn [i r] [i r]) peers)))
 
-;; ---- Rust subprocess management ----
+;; ---- per-party artifact paths ----
 
-(defn- locate-crypto-core
-  "Find the mpc-crypto-core binary. Prefers release; falls back to debug.
-   MPC_CRYPTO_CORE env var overrides both."
-  []
+(defn- artifact-path
+  "<project-root>/<role>/<kind>/<handle>.bin"
+  [role kind handle-uuid]
+  (-> (System/getProperty "user.dir")
+      (java.io.File. (str (name role) "/" (name kind) "/" handle-uuid ".bin"))
+      .getCanonicalPath))
+
+;; ---- Rust subprocess ----
+
+(defn- locate-crypto-core []
   (or (System/getenv "MPC_CRYPTO_CORE")
-      (let [base   (System/getProperty "user.dir")
+      (let [base (System/getProperty "user.dir")
             release (java.io.File. base "crypto-core/target/release/mpc-crypto-core")
             debug   (java.io.File. base "crypto-core/target/debug/mpc-crypto-core")]
         (.getCanonicalPath (if (.exists release) release debug)))))
@@ -77,34 +85,105 @@
                :data  {:role role :bin bin}})
     (.start pb)))
 
-;; ---- JSON <-> EDN translation ----
+;; ---- EDN ↔ JSON translation: begin-* messages ----
 
-(defn- share-path
-  "Per-party share file path: <project-root>/<role>/shares/<handle>.bin.
-   Per the design doc, handle namespace is per-party."
-  [role handle-uuid]
-  (-> (System/getProperty "user.dir")
-      (java.io.File. (str (name role) "/shares/" handle-uuid ".bin"))
-      .getCanonicalPath))
-
-(defn- begin->json
-  "Translate a :ceremony/begin-keygen EDN map into the JSON map the
-   Rust binary expects. Uses `peers` (a vector of role keywords) to
-   map `me` and the integer-indexed peer list. Adds the per-party
-   share file path that the Rust binary writes its KeygenOutput to."
-  [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold]}
-   handle-uuid]
+(defn- begin-keygen->json
+  [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold
+           :ceremony/share-handle]}]
   (let [r->i (role->id-map peers)]
     {:msg_type    "begin_keygen"
      :ceremony_id (str id)
      :me          (get r->i me)
      :peers       (vec (range (count peers)))
      :threshold   threshold
-     :share_path  (share-path me handle-uuid)}))
+     :share_path  (artifact-path me "shares" share-handle)}))
+
+(defn- begin-triples->json
+  [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold
+           :ceremony/triple-handle]}]
+  (let [r->i (role->id-map peers)]
+    {:msg_type    "begin_triples"
+     :ceremony_id (str id)
+     :me          (get r->i me)
+     :peers       (vec (range (count peers)))
+     :threshold   threshold
+     :triple_path (artifact-path me "triples" triple-handle)}))
+
+(defn- begin-presign->json
+  [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold
+           :ceremony/share-handle :ceremony/triple-handle :ceremony/presig-handle]}]
+  (let [r->i (role->id-map peers)]
+    {:msg_type    "begin_presign"
+     :ceremony_id (str id)
+     :me          (get r->i me)
+     :peers       (vec (range (count peers)))
+     :threshold   threshold
+     :share_path  (artifact-path me "shares" share-handle)
+     :triple_path (artifact-path me "triples" triple-handle)
+     :presig_path (artifact-path me "presigs" presig-handle)}))
+
+(defn- begin-sign->json
+  [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold
+           :ceremony/coordinator :ceremony/share-handle :ceremony/presig-handle
+           :ceremony/digest-hex]}]
+  (let [r->i (role->id-map peers)]
+    {:msg_type    "begin_sign"
+     :ceremony_id (str id)
+     :me          (get r->i me)
+     :peers       (vec (range (count peers)))
+     :threshold   threshold
+     :coordinator (get r->i coordinator)
+     :share_path  (artifact-path me "shares" share-handle)
+     :presig_path (artifact-path me "presigs" presig-handle)
+     :digest_hex  digest-hex}))
+
+(defn- begin-reshare->json
+  [{:keys [:ceremony/id :ceremony/me :ceremony/old-peers :ceremony/old-threshold
+           :ceremony/new-peers :ceremony/new-threshold
+           :ceremony/old-share-handle :ceremony/new-share-handle
+           :ceremony/public-key-hex]}]
+  ;; Both old and new participant lists need a shared integer-id space;
+  ;; we use the union, with new-peers taking precedence for duplicate
+  ;; roles. The Rust side validates internally.
+  (let [union   (vec (distinct (concat old-peers new-peers)))
+        r->i    (role->id-map union)
+        old-int (mapv #(get r->i %) old-peers)
+        new-int (mapv #(get r->i %) new-peers)]
+    {:msg_type        "begin_reshare"
+     :ceremony_id     (str id)
+     :me              (get r->i me)
+     :old_peers       old-int
+     :old_threshold   old-threshold
+     :new_peers       new-int
+     :new_threshold   new-threshold
+     :old_share_path  (when old-share-handle
+                        (artifact-path me "shares" old-share-handle))
+     :public_key_hex  public-key-hex
+     :new_share_path  (artifact-path me "shares" new-share-handle)}))
+
+(defn- begin->json
+  "Dispatch on :msg/type to the appropriate translator."
+  [msg]
+  (case (:msg/type msg)
+    :ceremony/begin-keygen   (begin-keygen->json msg)
+    :ceremony/begin-triples  (begin-triples->json msg)
+    :ceremony/begin-presign  (begin-presign->json msg)
+    :ceremony/begin-sign     (begin-sign->json msg)
+    :ceremony/begin-reshare  (begin-reshare->json msg)
+    (throw (ex-info "Unknown begin-* message type" {:type (:msg/type msg)}))))
+
+(defn- begin-msg-peers
+  "Return the role-keyword peer list from a begin message — used to
+   build the role↔id mapping for the rest of the ceremony's messages.
+   For begin-reshare the ceremony's working participant set is the
+   new-peers (those who emit/receive protocol messages)."
+  [msg]
+  (case (:msg/type msg)
+    :ceremony/begin-reshare (vec (distinct (concat (:ceremony/old-peers msg)
+                                                   (:ceremony/new-peers msg))))
+    (:ceremony/peers msg)))
 
 (defn- deliver->json
-  "Translate a :protocol/deliver EDN map (from orchestrator) into the
-   JSON `protocol_deliver` for the Rust binary."
   [r->i {:keys [:ceremony/id :protocol/from :protocol/body]}]
   {:msg_type    "protocol_deliver"
    :ceremony_id (str id)
@@ -115,11 +194,18 @@
   {:msg_type    "cancel"
    :ceremony_id (str id)})
 
+;; ---- JSON → EDN: outbound from Rust to orchestrator ----
+
+(defn- json-result->edn-result
+  "Translate a JSON result map (snake_case keys, leaf values) into an
+   EDN result map (`:result/kebab-case` keys). Mechanical."
+  [m]
+  (into {}
+        (for [[k v] m]
+          [(keyword "result" (str/replace (name k) "_" "-")) v])))
+
 (defn- json->edn-out
-  "Translate one JSON map (received from Rust stdout) into the EDN
-   message to forward to the orchestrator. Returns nil for unknown
-   shapes."
-  [i->r ceremony-id-uuid handle-uuid m]
+  [i->r ceremony-id-uuid m]
   (case (get m "msg_type")
     "protocol_broadcast"
     {:msg/type      :protocol/broadcast
@@ -137,16 +223,13 @@
     "ceremony_complete"
     {:msg/type        :ceremony/complete
      :ceremony/id     ceremony-id-uuid
-     :ceremony/result {:result/handle      handle-uuid
-                       :result/public-key  (get m "public_key_hex")
-                       :result/fingerprint (get m "share_fingerprint")
-                       :result/signature   nil}}
+     :ceremony/result (json-result->edn-result (get m "result"))}
 
     "ceremony_error"
-    {:msg/type        :ceremony/error
-     :ceremony/id     ceremony-id-uuid
-     :ceremony/error  {:category (get m "category")
-                       :message  (get m "message")}}
+    {:msg/type       :ceremony/error
+     :ceremony/id    ceremony-id-uuid
+     :ceremony/error {:category (get m "category")
+                      :message  (get m "message")}}
 
     nil))
 
@@ -165,13 +248,7 @@
     (.flush ^java.io.Writer out)))
 
 (defn- spawn-rust-reader-thread!
-  "Read JSON-Lines from the Rust subprocess stdout, translate to EDN,
-   forward to the orchestrator (`out` = *out*). Sets `done?` when the
-   Rust process emits ceremony_complete or ceremony_error or its
-   stdout closes — after which the main loop drops late-arriving
-   :protocol/deliver messages per the chart's
-   :late-protocol-message-after-final cross-cutting rule."
-  [role i->r ceremony-id-uuid handle-uuid rust-stdout out done?]
+  [role i->r ceremony-id-uuid rust-stdout out done?]
   (let [reader (BufferedReader. (java.io.InputStreamReader. rust-stdout))]
     (doto (Thread. ^Runnable
            (fn []
@@ -180,7 +257,7 @@
                  (let [line (.readLine reader)]
                    (when line
                      (let [m   (json/parse-string line)
-                           edn (json->edn-out i->r ceremony-id-uuid handle-uuid m)]
+                           edn (json->edn-out i->r ceremony-id-uuid m)]
                        (when edn
                          (send-edn! out edn))
                        (when (#{"ceremony_complete" "ceremony_error"} (get m "msg_type"))
@@ -200,20 +277,17 @@
 ;; ---- per-ceremony state machine ----
 
 (defn- run-ceremony! [role begin-msg in-reader out-writer]
-  (let [peers          (:ceremony/peers begin-msg)
+  (let [peers          (begin-msg-peers begin-msg)
         r->i           (role->id-map peers)
         i->r           (id->role-map peers)
         ceremony-id    (:ceremony/id begin-msg)
-        handle-uuid    (uuidv7/uuidv7)
         rust-process   (spawn-crypto-core! role)
         rust-stdin     (BufferedWriter. (java.io.OutputStreamWriter.
                                          (.getOutputStream rust-process)))
         done?          (atom false)]
-    (spawn-rust-reader-thread! role i->r ceremony-id handle-uuid
+    (spawn-rust-reader-thread! role i->r ceremony-id
                                (.getInputStream rust-process) out-writer done?)
-    ;; Send begin to Rust.
-    (send-json! rust-stdin (begin->json begin-msg handle-uuid))
-    ;; Pump orchestrator stdin -> Rust stdin until EOF or cancel.
+    (send-json! rust-stdin (begin->json begin-msg))
     (loop []
       (let [msg (try (edn/read {:eof ::eof} in-reader)
                      (catch Exception _e ::eof))]
@@ -227,8 +301,6 @@
 
           (= :protocol/deliver (:msg/type msg))
           (do (if @done?
-                ;; Late-arriving protocol message after this party's
-                ;; ceremony already concluded — drop silently.
                 (log/log! {:level :debug
                            :id    :mpc-multi-signature.party.core/late-deliver-dropped
                            :data  {:role role
@@ -236,8 +308,6 @@
                                    :from (:protocol/from msg)}})
                 (try (send-json! rust-stdin (deliver->json r->i msg))
                      (catch java.io.IOException _e
-                       ;; Race: Rust exited between @done? check and
-                       ;; the write. Treat as late-and-dropped.
                        (reset! done? true))))
               (recur))
 
@@ -254,6 +324,10 @@
               (recur)))))))
 
 ;; ---- entry ----
+
+(def ^:private begin-types
+  #{:ceremony/begin-keygen :ceremony/begin-triples :ceremony/begin-presign
+    :ceremony/begin-sign   :ceremony/begin-reshare})
 
 (defn -main [& args]
   (let [{:keys [role]} (parse-args args)]
@@ -273,7 +347,7 @@
                        :id    :mpc-multi-signature.party.core/eof
                        :data  {:role role}})
 
-            (= :ceremony/begin-keygen (:msg/type msg))
+            (begin-types (:msg/type msg))
             (do (run-ceremony! role msg in-reader out-writer)
                 (recur))
 

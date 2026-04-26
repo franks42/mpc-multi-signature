@@ -20,18 +20,14 @@
              :data  {:ceremony-id ceremony-id :from from :to to}}))
 
 (defn- send-begin-to-all!
-  "Statechart action :action/send-begin-to-all-participants. For Stage 1
-   keygen: emit :ceremony/begin-keygen to each participant connection."
-  [connections-by-role ceremony-id participants threshold]
+  "Statechart action :action/send-begin-to-all-participants.
+   `make-begin-msg` is a function `(fn [me]) → EDN-begin-map` that
+   produces the per-participant begin message — it varies per ceremony
+   type but the broadcast loop is generic."
+  [connections-by-role participants make-begin-msg]
   (doseq [me participants
           :let [conn (get connections-by-role me)]]
-    (party/send! conn
-                 {:msg/type            :ceremony/begin-keygen
-                  :ceremony/id         ceremony-id
-                  :ceremony/me         me
-                  :ceremony/peers      (vec participants)
-                  :ceremony/threshold  threshold
-                  :ceremony/scheme     :ecdsa/secp256k1-ot-based})))
+    (party/send! conn (make-begin-msg me))))
 
 (defn- channel->role [connections-by-role ch]
   (some (fn [[r conn]] (when (identical? ch (:inbound conn)) r))
@@ -109,9 +105,9 @@
 (defn- keygen-consistency-check
   "Statechart action :action/keygen-consistency-check. Returns
    {:passed? true :public-key pk} if all parties agree on
-   :result/public-key; {:passed? false :reason ...} otherwise."
+   :result/public-key-hex; {:passed? false :reason ...} otherwise."
   [results]
-  (let [pks (into #{} (map :result/public-key) (vals results))]
+  (let [pks (into #{} (map :result/public-key-hex) (vals results))]
     (cond
       (= 1 (count pks))    {:passed? true :public-key (first pks)}
       (zero? (count pks))  {:passed? false :reason :reason/no-results}
@@ -145,9 +141,18 @@
    uses core.async to wait on multiple inbound channels."
   [{:keys [connections-by-role]} participants {:keys [threshold deadline-ms]
                                                :or   {threshold 2 deadline-ms 5000}}]
-  (let [ceremony-id (uuidv7/uuidv7)]
+  (let [ceremony-id  (uuidv7/uuidv7)
+        share-handle (uuidv7/uuidv7)
+        make-begin   (fn [me]
+                       {:msg/type            :ceremony/begin-keygen
+                        :ceremony/id         ceremony-id
+                        :ceremony/me         me
+                        :ceremony/peers      (vec participants)
+                        :ceremony/threshold  threshold
+                        :ceremony/share-handle share-handle
+                        :ceremony/scheme     :ecdsa/secp256k1-ot-based})]
     (transition! ceremony-id :state/pending :state/starting)
-    (send-begin-to-all! connections-by-role ceremony-id participants threshold)
+    (send-begin-to-all! connections-by-role participants make-begin)
 
     (transition! ceremony-id :state/starting :state/running)
     (let [{:keys [results error] :as outcome}
@@ -169,10 +174,11 @@
               {:keys [passed? public-key reason] :as check}
               (keygen-consistency-check results)]
           (if passed?
-            (let [handles (into {} (map (fn [[r m]] [r (:result/handle m)])) results)
-                  result  {:public-key  public-key
-                           :handles     handles
-                           :ceremony/id ceremony-id}]
+            (let [handles (into {} (map (fn [[r _m]] [r share-handle])) results)
+                  result  {:public-key   public-key
+                           :share-handle share-handle
+                           :handles      handles ; legacy: all roles map to share-handle
+                           :ceremony/id  ceremony-id}]
               (transition! ceremony-id :state/finalizing :state/complete)
               (log/log! {:level :info
                          :id    :mpc-multi-signature.orchestrator.ceremony/complete
