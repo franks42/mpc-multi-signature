@@ -22,6 +22,7 @@
   (:require [cheshire.core :as json]
             [clojure.edn :as edn]
             [clojure.string :as str]
+            [signet.encryption :as signet-encryption]
             [signet.key :as signet-key]
             [signet.session :as signet-session]
             [signet.sign :as signet-sign]
@@ -83,6 +84,127 @@
    setups; today we keep things minimal."
   []
   (signet-key/signing-keypair))
+
+;; ---- encryption-at-rest for per-party artifacts (Stage 5b.3) ----
+;;
+;; The persistent files <role>/{shares,triples,presigs}/<handle>.bin
+;; that crypto-core reads and writes are encrypted with a party-local
+;; KEK derived deterministically from the bb wrapper's long-term
+;; identity key. Same wrapper across restarts can read its own files;
+;; nothing else can.
+;;
+;; Mechanism: signet.encryption/box with the same identity keypair as
+;; both sender and recipient — static-static X25519 DH(priv, self.pub)
+;; produces a deterministic shared secret unique to this identity,
+;; from which signet derives a 32-byte ChaCha20-Poly1305 key. Each
+;; encrypted file is `nonce(12) || AEAD-ciphertext-with-tag`. No AAD
+;; today; future enhancement could bind a file to its purpose
+;; (artifact kind, wallet pubkey, etc).
+;;
+;; Path-proxy strategy: crypto-core reads/writes plaintext at temp
+;; paths under java.io.tmpdir; the bb wrapper decrypts canonical
+;; files into temps before crypto-core spawn and encrypts temp
+;; outputs back into canonical files on ceremony success. Temps are
+;; deleted on every exit path. Crypto-core is unchanged.
+
+(defn- self-box
+  "Encrypt with the bb wrapper's identity keypair as both sender and
+   recipient. Yields a deterministic ciphertext-with-fresh-nonce that
+   only this party can decrypt."
+  [identity-kp ^bytes plaintext]
+  (signet-encryption/box identity-kp identity-kp plaintext))
+
+(defn- self-unbox
+  [identity-kp ^bytes ciphertext]
+  (signet-encryption/unbox identity-kp identity-kp ciphertext))
+
+(defn- read-bytes
+  ^bytes [^String path]
+  (java.nio.file.Files/readAllBytes (java.nio.file.Paths/get path (into-array String []))))
+
+(defn- write-bytes!
+  [^String path ^bytes content]
+  (let [parent (.getParentFile (java.io.File. path))]
+    (when parent (.mkdirs parent)))
+  (java.nio.file.Files/write
+   (java.nio.file.Paths/get path (into-array String []))
+   content
+   (into-array java.nio.file.OpenOption [])))
+
+(def ^:private path-fields
+  "Keys in a begin-* JSON map (keyword form, before cheshire serializes
+   to snake_case strings) that name file paths. The bb wrapper
+   substitutes temp paths for these before forwarding to crypto-core."
+  #{:share_path :triple_path :presig_path
+    :old_share_path :new_share_path})
+
+(defn- ceremony-tempdir!
+  "Create a per-ceremony tempdir under java.io.tmpdir; returns its
+   absolute path. Caller is responsible for deleting on ceremony end."
+  [role ceremony-id]
+  (let [base (System/getProperty "java.io.tmpdir")
+        dir  (str base "/mpc-" (name role) "-" ceremony-id)]
+    (.mkdirs (java.io.File. dir))
+    dir))
+
+(defn- delete-tempdir!
+  [^String dir]
+  (try
+    (let [d (java.io.File. dir)]
+      (when (.isDirectory d)
+        (doseq [f (.listFiles d)]
+          (.delete ^java.io.File f))
+        (.delete d)))
+    (catch Exception _ nil)))
+
+(defn- prepare-paths!
+  "Walk a begin-* JSON map; substitute temp paths for every *_path
+   field. For canonical paths that already exist (= ceremony inputs),
+   decrypt content into the temp file. For paths that don't exist
+   (= ceremony outputs), leave the temp file uncreated and let
+   crypto-core write it.
+
+   Returns:
+     {:translated-json <begin-msg with temp paths>
+      :path-pairs      [{:canonical <path> :temp <path> :input? <bool>}]}
+
+   The caller's finalize-paths! consumes :path-pairs."
+  [begin-json identity-kp ^String tempdir]
+  (let [pairs    (atom [])
+        translate
+        (fn [k v]
+          (if (and (path-fields k) (some? v))
+            (let [canonical v
+                  temp     (str tempdir "/" (java.util.UUID/randomUUID) ".bin")
+                  input?   (.exists (java.io.File. ^String canonical))]
+              (when input?
+                (let [pt (self-unbox identity-kp (read-bytes canonical))]
+                  (write-bytes! temp pt)))
+              (swap! pairs conj
+                     {:canonical canonical
+                      :temp      temp
+                      :input?    input?})
+              temp)
+            v))
+        translated (into {} (for [[k v] begin-json] [k (translate k v)]))]
+    {:translated-json translated
+     :path-pairs      @pairs}))
+
+(defn- finalize-paths!
+  "After crypto-core completes a ceremony, walk the recorded path
+   pairs:
+     - On success, encrypt each output's temp content into its
+       canonical path.
+     - On either success or failure, delete every temp file.
+   Inputs are not re-encrypted (canonical was untouched).
+   Tempdir cleanup is delete-tempdir!'s responsibility."
+  [path-pairs identity-kp success?]
+  (doseq [{:keys [canonical temp input?]} path-pairs]
+    (when (and success? (not input?)
+               (.exists (java.io.File. ^String temp)))
+      (let [pt (read-bytes temp)
+            ct (self-box identity-kp pt)]
+        (write-bytes! canonical ct)))))
 
 ;; ---- per-ceremony Noise_KK pairwise sessions (Stage 5b.1) ----
 ;;
@@ -413,8 +535,13 @@
    protocol_broadcast bodies are AEAD-wrapped via the per-peer
    Noise_KK session before being forwarded; broadcast is fanned out
    to one private message per peer (one ciphertext per recipient,
-   each authenticated to that pair)."
-  [role i->r ceremony-id-uuid rust-stdout out done?
+   each authenticated to that pair).
+
+   `outcome` is an atom set to :complete or :error when the matching
+   message arrives from crypto-core. run-ceremony!'s post-loop logic
+   uses it to decide whether output artifacts should be encrypted to
+   their canonical paths (success) or just deleted (failure)."
+  [role i->r ceremony-id-uuid rust-stdout out done? outcome
    {:keys [binding-mode? identity-kp sessions]}]
   (let [reader (BufferedReader. (java.io.InputStreamReader. rust-stdout))
         ;; Snapshot peers at thread start; the session keyset is
@@ -464,6 +591,7 @@
                                       (augment-with-binding-signature edn identity-kp)
                                       edn)]
                            (send-edn! out edn)
+                           (reset! outcome :complete)
                            (reset! done? true))
 
                          "ceremony_error"
@@ -472,6 +600,7 @@
                                          :ceremony/id    ceremony-id-uuid
                                          :ceremony/error {:category (get m "category")
                                                           :message  (get m "message")}})
+                             (reset! outcome :error)
                              (reset! done? true))
 
                          ;; Unknown msg type from crypto-core
@@ -526,23 +655,40 @@
         ;; :protocol/private; once every peer's session is
         ;; established, the function returns.
         _              (do-handshakes! role sessions in-reader out-writer ceremony-id)
+        ;; Stage 5b.3: encryption-at-rest. Translate the begin-*'s
+        ;; canonical *_path fields into temp paths under a per-
+        ;; ceremony tempdir; decrypt any existing canonical input
+        ;; files into temps; track which paths are outputs so we
+        ;; can encrypt them back into canonical files on success.
+        tempdir        (ceremony-tempdir! role ceremony-id)
+        {translated-json :translated-json
+         path-pairs      :path-pairs}
+        (prepare-paths! (begin->json begin-msg) identity-kp tempdir)
         rust-process   (spawn-crypto-core! role)
         rust-stdin     (BufferedWriter. (java.io.OutputStreamWriter.
                                          (.getOutputStream rust-process)))
         done?          (atom false)
+        outcome        (atom nil) ; set by rust-reader to :complete or :error
         wait-and-log!  (fn []
                          (try (.close rust-stdin) (catch Exception _ nil))
                          (.waitFor rust-process)
                          (log/log! {:level :info
                                     :id    :mpc-multi-signature.party.core/ceremony-end
                                     :data  {:role role
-                                            :exit-code (.exitValue rust-process)}}))]
+                                            :exit-code (.exitValue rust-process)
+                                            :outcome   @outcome}})
+                         ;; On success, encrypt temp outputs into
+                         ;; canonical paths. On any other outcome,
+                         ;; leave canonical paths untouched. Always
+                         ;; clean up the tempdir.
+                         (finalize-paths! path-pairs identity-kp (= :complete @outcome))
+                         (delete-tempdir! tempdir))]
     (spawn-rust-reader-thread! role i->r ceremony-id
-                               (.getInputStream rust-process) out-writer done?
+                               (.getInputStream rust-process) out-writer done? outcome
                                {:binding-mode? binding-mode?
                                 :identity-kp   identity-kp
                                 :sessions      sessions})
-    (send-json! rust-stdin (begin->json begin-msg))
+    (send-json! rust-stdin translated-json)
     (loop []
       (let [msg (try (edn/read {:eof ::eof} in-reader)
                      (catch Exception _e ::eof))]
