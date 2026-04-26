@@ -437,7 +437,27 @@
    :consumers [:actor/commitment-tas]
    :lifetime :lifetime/permanent
    :storage [:state/recovery-key] ; or wherever the holder keeps it
-   :scheme :scheme/hash-commitment}}
+   :scheme :scheme/hash-commitment}
+
+  :crypto/share-possession-transcript
+  {:id :crypto/share-possession-transcript
+   :name "Share-possession proof transcript"
+   :description "Per-party transcript produced by a share-possession
+                 proof ceremony. Always carries a non-interactive
+                 Schnorr proof of knowledge of x_i against X_i = x_i·G,
+                 bound to a verifier-supplied challenge context. In
+                 identity-share binding mode, additionally carries the
+                 party's Ed25519 identity public key and an Ed25519
+                 signature over the Schnorr transcript — together
+                 these weld an Ed25519 identity to an MPC share. Wire
+                 form for the Schnorr transcript is 65 bytes raw:
+                 R_compressed (33 bytes) || s (32 bytes)."
+   :kind :kind/proof
+   :producer :ceremony/share-possession-proof
+   :consumers [:role/share-holder :role/coordinator] ; any verifier
+   :lifetime :lifetime/freshness-windowed ; replay-safe within the bound context's freshness
+   :storage :ephemeral
+   :scheme :scheme/ot-based-ecdsa-secp256k1}}
 
  ;; ============================================================
  ;; LAYER 3: WALLET-STATE ENTITIES
@@ -858,7 +878,36 @@
    :authorization "TAS-specific. KYC: passes identity verification.
                    Commitment: reveals secret matching registered hash.
                    Social: k of n contacts confirm."
-   :phases [:phase/authentication :phase/issuance]}}
+   :phases [:phase/authentication :phase/issuance]}
+
+  :ceremony/share-possession-proof
+  {:id :ceremony/share-possession-proof
+   :name "Share-possession proof ceremony"
+   :description "Each participating share-holder produces a non-
+                 interactive Schnorr proof of knowledge of its share
+                 scalar x_i against its public verification share
+                 X_i = x_i·G, bound to a verifier-supplied challenge
+                 context. Optional identity-share binding mode: the
+                 challenge context is bound to the party's Ed25519
+                 identity public key and the proof transcript is
+                 additionally signed by that identity key, welding
+                 the Ed25519 identity to the MPC share. No protocol
+                 messages are exchanged between parties; each party
+                 computes its proof locally. No share material leaves
+                 the party. The orchestrator collects transcripts; any
+                 verifier with the keygen-time verification shares can
+                 check them independently."
+   :kind :kind/cryptographic
+   :participants [:actor/holder :actor/figure :actor/independent-custodian]
+   :coordinator :variable
+   :inputs [:crypto/wallet-keygen-output] ; verification-share + share-handle
+   :outputs [:crypto/share-possession-transcript] ; per-party Schnorr PoK + (binding mode) Ed25519 signature
+   :authorization "Open: any verifier may request a proof by supplying a
+                   fresh challenge context. The proof's binding to that
+                   context is what makes it replay-safe; the ceremony
+                   itself has no attestation gate."
+   :scheme :scheme/ot-based-ecdsa-secp256k1
+   :phases [:phase/proof-issuance]}}
 
  ;; ============================================================
  ;; LAYER 5: EVENTS

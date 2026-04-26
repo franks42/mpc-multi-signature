@@ -1,0 +1,422 @@
+;; Statechart: Share-possession proof ceremony (Stage 5a)
+;;
+;; Source: data-dictionary.edn :ceremony/share-possession-proof
+;;
+;; Models the orchestrator-side per-ceremony lifecycle of a share-
+;; possession proof. Each participating share-holder produces a non-
+;; interactive Schnorr proof of knowledge of its share scalar x_i
+;; against its public verification share X_i = x_i·G, bound to a
+;; verifier-supplied challenge context. Outcome: per-party transcripts
+;; (:crypto/share-possession-transcript) the orchestrator collects
+;; and any verifier with the keygen-time verification shares can
+;; check independently.
+;;
+;; --- key shape differences from the keygen template ---
+;;
+;;   - Non-interactive. No protocol messages are exchanged between
+;;     parties. Each party computes its proof locally from its share
+;;     and the supplied challenge context, then emits
+;;     :ceremony/complete carrying the transcript. :state/running
+;;     therefore does NOT carry an :event/protocol-message-emit
+;;     transition; the only progress event within :running is
+;;     :event/ceremony-complete.
+;;
+;;   - Variable participant set. Unlike keygen (always 3) and routine
+;;     sign (always 2-of-3 minus IC), a share-possession proof can be
+;;     requested from any subset of share-holders. The IC is a legal
+;;     participant when online; absent participants simply do not have
+;;     a region.
+;;
+;;   - No shared consistency check. Each party's transcript stands
+;;     alone — it binds to that party's verification share and the
+;;     verifier's challenge context. Finalization collects transcripts
+;;     and exits; the actual cryptographic verification is the
+;;     verifier's responsibility, not the ceremony's. (Rationale: the
+;;     ceremony is the proof producer; verification is intentionally
+;;     decoupled so independent verifiers — Figure, IC, an external
+;;     auditor — can each check the same transcripts under their own
+;;     trust assumptions.)
+;;
+;;   - Identity-share binding mode. When the verifier supplies per-
+;;     party challenge contexts of the form ctx_r = H(verifier-nonce
+;;     || K_id_pub_r), and additionally requires each party's Ed25519
+;;     signature over its Schnorr transcript, the ceremony produces
+;;     an identity-share binding proof. This is composition (the
+;;     binding signature is added by the orchestrator wrapper after
+;;     :state/complete), not a structural change to the chart.
+;;
+;; Convention: [event] denotes a transition trigger;
+;;             {action} denotes an entry/exit action;
+;;             (guard) denotes a transition guard.
+
+{:statechart/id           :statechart/ceremony-share-possession-proof
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/share-possession-proof
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle"
+ :statechart/template     :statechart/ceremony-keygen ; specializes; protocol-relay simplified out
+
+ :statechart/context
+ ;; Ceremony-instance state held alongside the statechart's state.
+ {:ceremony/id              :uuid              ; unique ceremony identifier
+  :ceremony/participants    []                 ; subset of share-holders requested for this proof
+  :ceremony/coordinator     :actor/figure      ; or any verifier acting as coordinator
+  :ceremony/scheme          :scheme/ot-based-ecdsa-secp256k1
+  :ceremony/deadline        :timestamp         ; default short (~30 s); proof is local compute
+  :ceremony/share-handle    nil                ; opaque handle into the keygen-output store
+  :ceremony/challenge-context :uniform-or-per-role ; verifier-supplied; either uniform or {role hex}
+  :ceremony/per-party-state {}                 ; populated at :state/starting from :ceremony/participants
+  :ceremony/transcripts     {}                 ; party -> :crypto/share-possession-transcript
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  ;; Ceremony record exists; verifier has supplied the share-handle
+  ;; and challenge context but participants have not been contacted
+  ;; yet.
+  {:on {:event/begin-ceremony
+        {:target  :state/starting
+         :actions [:action/record-deadline
+                   :action/record-share-handle
+                   :action/record-challenge-context
+                   :action/init-per-party-state]}
+
+        :event/cancel
+        {:target  :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  ;; Send :ceremony/begin-share-proof to every participant. Each
+  ;; participant immediately begins its local proof computation; no
+  ;; further coordinator action is needed until completions arrive.
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/ceremony-complete
+          ;; A party may complete and emit before any other party has
+          ;; been observed — the local-only nature of this proof means
+          ;; the first :ceremony/complete can arrive before the
+          ;; orchestrator has even finished sending the begin
+          ;; broadcast. Move to :state/running so the standard
+          ;; collection logic picks it up.
+          {:target :state/running
+           :actions [:action/record-party-done]}
+
+          :event/ceremony-error
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Parallel region: each participant has its own party-substate.
+  ;; Unlike keygen, there is NO :event/protocol-message-emit
+  ;; transition — share-possession proofs are non-interactive and
+  ;; parties never emit protocol messages to each other.
+  ;;
+  ;; The aggregate :running state inspects :ceremony/per-party-state
+  ;; on each :event/ceremony-complete to detect "all parties done"
+  ;; and advance to :state/finalizing.
+  {:on {;; A party reports its proof transcript. Guarded transitions
+        ;; evaluated in order: stay in :running while other parties
+        ;; are still pending; advance to :finalizing on the last
+        ;; party's completion.
+        :event/ceremony-complete
+        [{:target  :state/running
+          :actions [:action/record-party-done
+                    :action/check-all-parties-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}
+
+   ;; Per-participant regions. Each participant's substate is the
+   ;; minimal "awaiting → done" pair (no relaying state, since there
+   ;; is no protocol message routing). The number of regions is
+   ;; variable: one per actor in :ceremony/participants. The shape
+   ;; below shows the holder + figure + IC case; a ceremony with a
+   ;; subset omits the corresponding regions. Expanded inline rather
+   ;; than via {:like ... :substitute-actor ...} shorthand so the
+   ;; chart parses as plain clj-statecharts data.
+   :statechart/parallel-regions
+   {:region/holder
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/ceremony-complete
+                     {:target :party-state/done
+                      :guards [(guard/originated-from :actor/holder)]}
+
+                     :event/ceremony-error
+                     {:target :party-state/errored
+                      :guards [(guard/originated-from :actor/holder)]}}}
+
+               :party-state/done
+               ;; Terminal substate within :running.
+               {}
+
+               :party-state/errored
+               ;; Terminal substate within :running.
+               {}}}
+
+    :region/figure
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/ceremony-complete
+                     {:target :party-state/done
+                      :guards [(guard/originated-from :actor/figure)]}
+
+                     :event/ceremony-error
+                     {:target :party-state/errored
+                      :guards [(guard/originated-from :actor/figure)]}}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/independent-custodian
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/ceremony-complete
+                     {:target :party-state/done
+                      :guards [(guard/originated-from :actor/independent-custodian)]}
+
+                     :event/ceremony-error
+                     {:target :party-state/errored
+                      :guards [(guard/originated-from :actor/independent-custodian)]}}}
+
+               :party-state/done {}
+               :party-state/errored {}}}}}
+
+  :state/finalizing
+  ;; All parties have reported. Collect transcripts into a single
+  ;; ceremony-result map for the verifier. NOTE: this state does NOT
+  ;; cryptographically verify the proofs — that is intentionally the
+  ;; verifier's responsibility (see chart header). Finalization here
+  ;; is purely structural: every requested participant has emitted a
+  ;; well-formed transcript.
+  {:entry [:action/collect-transcripts
+           :action/share-proof-shape-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          ;; Some transcript was missing or malformed (e.g. wrong
+          ;; length on the Schnorr R||s field). Distinct from a
+          ;; cryptographic verification failure, which the verifier
+          ;; would surface separately.
+          {:target  :state/aborting
+           :actions [:action/record-error]}}}
+
+  :state/complete
+  ;; FINAL state on success. The ceremony's job is done; the verifier
+  ;; can now run the cryptographic verification independently with
+  ;; the keygen-time verification shares.
+  {:type :final
+   :entry [:action/notify-coordinator-success
+           :action/return-transcripts]
+   :on   {}}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  ;; FINAL state on failure.
+  {:type :final
+   :entry [:action/notify-coordinator-failure]
+   :on   {}}}
+
+ ;; --- Action and guard descriptions ---
+ ;; Actions specific to this ceremony are documented here. Actions
+ ;; inherited from the keygen template (record-deadline,
+ ;; start-deadline-timer, record-party-done, send-cancel-to-all-
+ ;; participants, etc.) are not duplicated.
+
+ :statechart/actions
+ {:action/record-share-handle
+  "Capture :ceremony/share-handle from the begin-ceremony event
+   payload. Opaque to the orchestrator; references the keygen-output
+   store at each party."
+
+  :action/record-challenge-context
+  "Capture :ceremony/challenge-context from the begin-ceremony event
+   payload. Either a single hex string (uniform across parties) or a
+   {role hex} map (per-party — used by identity-share binding mode
+   where each party's context is bound to its Ed25519 identity public
+   key)."
+
+  :action/init-per-party-state
+  "Initialize :ceremony/per-party-state with one
+   :party-state/awaiting entry per actor in :ceremony/participants.
+   The participant set is variable for this ceremony, so per-party
+   state cannot be hard-coded as in keygen."
+
+  :action/send-begin-to-all-participants
+  "Emit :ceremony/begin-share-proof to each :ceremony/participant.
+   Each begin message carries: the participant's role, the
+   participant-id map, the share-handle, and the participant-specific
+   challenge context (either the uniform value or this role's entry
+   from the per-role map)."
+
+  :action/record-party-done
+  "Update :ceremony/per-party-state for the originating party to
+   :party-state/done; record the party's transcript in
+   :ceremony/transcripts."
+
+  :action/collect-transcripts
+  "Aggregate :ceremony/transcripts into a coherent ceremony-wide
+   result structure suitable for return to the verifier. Each entry
+   carries: verification-share-hex, proof-hex (33 byte R || 32 byte
+   s), and the challenge-context-hex this party used."
+
+  :action/share-proof-shape-check
+  "Structural check (NOT cryptographic verification). Confirm every
+   participant in :ceremony/participants has a transcript in
+   :ceremony/transcripts; confirm every transcript's proof-hex is
+   exactly 65 bytes; confirm every transcript's verification-share-hex
+   is exactly 33 bytes (sec1 compressed). On pass, fire
+   :event/finalization-passed; on fail, :event/finalization-failed
+   with reason :reason/transcript-shape-violation."
+
+  :action/return-transcripts
+  "Resolve the verifier's promise with a result map of the form
+   {:proofs {role {:verification-share-hex ...
+                   :proof-hex ...
+                   :challenge-context-hex ...}}
+    :ceremony/id <uuid>}.
+   In identity-share binding mode the orchestrator wrapper augments
+   each per-party entry with :identity-pubkey-hex and
+   :identity-signature-hex AFTER the ceremony completes — that
+   composition is OUT OF SCOPE for this chart."
+
+  :action/notify-coordinator-success
+  "Resolve the verifier's promise with the ceremony result."
+
+  :action/notify-coordinator-failure
+  "Resolve the verifier's promise with the ceremony failure record.
+   Includes :ceremony/error and any forensic context."}
+
+ :statechart/guards
+ {:guard/at-least-one-party-still-running
+  "True iff fewer than (count :ceremony/participants) parties are
+   currently in :party-state/done."
+
+  :guard/all-parties-done-after-this-event
+  "True iff all but exactly one party is currently in
+   :party-state/done and the firing event is the last party's
+   :event/ceremony-complete."
+
+  :guard/originated-from
+  "True iff the firing event was emitted by the named actor.
+   Parameter: :actor/* keyword."}
+
+ ;; --- Cross-cutting transitions worth being explicit about ---
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/starting :state/running
+                          :state/finalizing]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes "Cancel is legal from every non-final state.
+                         :state/aborting itself does not handle cancel
+                         (already aborting)."}
+
+  {:cross-cutting/name :deadline-elapsed-from-any-non-final-state
+   :cross-cutting/states [:state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes "Deadlines for share-possession proofs are
+                         short (default ~30 s) since each proof is
+                         local compute with no network round trips."}
+
+  {:cross-cutting/name :no-protocol-relay
+   :cross-cutting/notes "Share-possession proofs are non-interactive.
+                         No state in this chart accepts
+                         :event/protocol-message-emit; if such an
+                         event arrives during this ceremony it is a
+                         protocol violation and should be logged and
+                         ignored, not routed."}
+
+  {:cross-cutting/name :late-completion-after-final
+   :cross-cutting/states [:state/complete :state/failed]
+   :cross-cutting/event :event/ceremony-complete
+   :cross-cutting/action :action/log-and-drop
+   :cross-cutting/notes "Late-arriving completions from a party that
+                         hasn't yet seen the cancel are normal and
+                         should not corrupt orchestrator state."}]
+
+ ;; --- Properties that should hold on this chart ---
+
+ :statechart/properties
+ [{:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel (directly or via cross-cutting)."}
+
+  {:property/name :no-protocol-message-routing
+   :property/check "No state's :on map references
+                    :event/protocol-message-emit. Share-possession
+                    proofs are local-compute, non-interactive; any
+                    such event is a protocol violation."}
+
+  {:property/name :no-share-material-leaves-party
+   :property/check "The orchestrator's view of a party's transcript
+                    is verification-share-hex (already public, equals
+                    the keygen-recorded X_i) plus the Schnorr proof
+                    transcript. The secret share scalar x_i never
+                    leaves the party. This holds by construction in
+                    crypto-core; the chart records it as an invariant
+                    so a future implementation cannot regress."}
+
+  {:property/name :verification-deferred-to-verifier
+   :property/check "No action in :state/finalizing performs the
+                    cryptographic verification (s·G == R + c·X_i) or
+                    the binding-mode Ed25519 verification. Both are
+                    intentionally the verifier's responsibility,
+                    invoked separately on the returned transcripts.
+                    :action/share-proof-shape-check performs only
+                    structural validation."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete must be reachable only from
+                    :state/finalizing; no direct path from :running
+                    to :complete bypasses :action/share-proof-shape-
+                    check."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check ":state/failed must be reachable only from
+                    :state/aborting (or directly from :state/pending
+                    on cancel before any party was contacted)."}
+
+  {:property/name :variable-participant-set
+   :property/check ":ceremony/participants may be any non-empty
+                    subset of share-holders. Per-party regions exist
+                    only for actors in :ceremony/participants; absent
+                    actors have no region. (Implementation hint:
+                    :action/init-per-party-state populates the
+                    region map dynamically.)"}]}
