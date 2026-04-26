@@ -22,6 +22,7 @@
   (:require [cheshire.core :as json]
             [clojure.edn :as edn]
             [clojure.string :as str]
+            [signet.key :as signet-key]
             [taoensso.timbre :as timbre]
             [taoensso.trove :as log]
             [taoensso.trove.timbre :as backend])
@@ -49,6 +50,24 @@
       (nil? k) acc
       (= "--role" k) (recur (assoc acc :role (keyword v)) more)
       :else (recur acc (cons v more)))))
+
+;; ---- per-party identity keypair ----
+;;
+;; Stage 5b.2: each party holds its own Ed25519 identity keypair. The
+;; private key never leaves the bb wrapper; only the public key is
+;; announced to the orchestrator at startup via a :party/identity
+;; handshake message. Production placement; replaces the harness-only
+;; orchestrator-side keypair generation we ran through Stage 5a.
+
+(defn- bytes->hex [^bytes bs]
+  (apply str (map #(format "%02x" (bit-and % 0xff)) bs)))
+
+(defn- make-identity-keypair
+  "Generate a fresh Ed25519 identity keypair for this bb wrapper. A
+   future revision may add an env-var override for repeatable test
+   setups; today we keep things minimal."
+  []
+  (signet-key/signing-keypair))
 
 ;; ---- per-party artifact paths ----
 
@@ -339,6 +358,21 @@
   #{:ceremony/begin-keygen :ceremony/begin-triples :ceremony/begin-presign
     :ceremony/begin-sign   :ceremony/begin-reshare :ceremony/begin-share-proof})
 
+(defn- send-identity-handshake!
+  "First message on stdout, before any ceremony is requested. Tells
+   the orchestrator this party's role and identity public key. The
+   orchestrator's start-orchestrator blocks until it has received one
+   such message per role; private key stays in this process."
+  [out-writer role identity-kp]
+  (send-edn! out-writer
+             {:msg/type           :party/identity
+              :role               role
+              :identity/pubkey-hex (bytes->hex (:x identity-kp))})
+  (log/log! {:level :info
+             :id    :mpc-multi-signature.party.core/identity-announced
+             :data  {:role role
+                     :identity-pubkey-hex (bytes->hex (:x identity-kp))}}))
+
 (defn -main [& args]
   (let [{:keys [role]} (parse-args args)]
     (when-not role
@@ -347,7 +381,9 @@
       (System/exit 1))
     (init-telemetry! role)
     (let [in-reader  (PushbackReader. *in*)
-          out-writer *out*]
+          out-writer *out*
+          identity-kp (make-identity-keypair)]
+      (send-identity-handshake! out-writer role identity-kp)
       (loop [pending nil]
         (let [msg (or pending
                       (try (edn/read {:eof ::eof} in-reader)
