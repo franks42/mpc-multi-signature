@@ -4,8 +4,8 @@
    a core.async channel; outbound is a synchronous write to the
    subprocess's stdin.
 
-   Stage 1 scope: subprocess is `bb null-party --role <role>` invoked
-   in the project's working directory."
+   The subprocess is `bb <bb-task> --role <role>` invoked in the
+   project's working directory; default task is \"party\"."
   (:require [clojure.core.async :as a]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -44,10 +44,10 @@
       (.start))))
 
 (defn start!
-  "Spawn `bb null-party --role <role>` in `working-dir`. Returns a
+  "Spawn `bb <bb-task> --role <role>` in `working-dir`. Returns a
    connection map: {:role :process :inbound :writer}."
   [{:keys [role working-dir bb-task]
-    :or   {bb-task "null-party"}}]
+    :or   {bb-task "party"}}]
   (let [pb       (doto (ProcessBuilder. ["bb" bb-task "--role" (name role)])
                    (.directory (io/file working-dir))
                    (.redirectError ProcessBuilder$Redirect/INHERIT))

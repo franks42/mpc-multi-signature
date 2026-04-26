@@ -16,6 +16,10 @@ pom.xml.asc
 *.log
 .DS_Store
 .claude/
-# Rust build output (391MB — never commit). Cargo.lock IS committed
+# Rust build output (~400MB — never commit). Cargo.lock IS committed
 # for binary reproducibility.
 crypto-core/target/
+# Per-party share stores. Runtime state, not source.
+holder/
+figure/
+ic/

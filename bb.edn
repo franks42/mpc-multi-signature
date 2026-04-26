@@ -13,15 +13,10 @@
   check  {:doc  "Run lint + format"
           :task (do (run 'format) (run 'lint))}
 
-  null-party
-  {:doc  "Run a null party stub. Args: --role <holder|figure|ic>"
-   :task (apply (requiring-resolve 'mpc-multi-signature.party.null/-main)
-                *command-line-args*)}
-
-  bb-rust-party
-  {:doc  "Run a bb wrapper that spawns the crypto-core Rust subprocess.
-          Args: --role <holder|figure|ic>"
-   :task (apply (requiring-resolve 'mpc-multi-signature.party.bb-rust/-main)
+  party
+  {:doc  "Run the party-bb wrapper. Spawns the crypto-core Rust
+          subprocess. Args: --role <holder|figure|ic>"
+   :task (apply (requiring-resolve 'mpc-multi-signature.party.core/-main)
                 *command-line-args*)}
 
   build-crypto-core

@@ -970,9 +970,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "hex",
  "rand_core",
+ "rmp-serde",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "threshold-signatures",
 ]

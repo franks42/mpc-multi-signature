@@ -1,4 +1,4 @@
-//! Stage 2 mpc-crypto-core binary.
+//! mpc-crypto-core binary.
 //!
 //! One-shot Rust subprocess spawned by a party-bb wrapper for the
 //! duration of a single ceremony. JSON-Lines stdio is the wire format
@@ -9,7 +9,8 @@
 //!
 //!   inbound stdin (one JSON object per line):
 //!     {"msg_type":"begin_keygen","ceremony_id":"<uuid>","me":0,
-//!      "peers":[0,1,2],"threshold":2}
+//!      "peers":[0,1,2],"threshold":2,
+//!      "share_path":"/abs/path/to/<role>/shares/<handle>.bin"}
 //!     {"msg_type":"protocol_deliver","ceremony_id":"<uuid>",
 //!      "from":<int>,"body":"<base64>"}
 //!     {"msg_type":"cancel","ceremony_id":"<uuid>"}
@@ -24,17 +25,24 @@
 //!     {"msg_type":"ceremony_error","ceremony_id":"<uuid>",
 //!      "category":"<string>","message":"<string>"}
 //!
-//! Stage 2 scope: keygen only. Sign and reshare arrive in later
-//! stages. Participants are integer ids (Participant::from(u32)); the
-//! bb wrapper maps role keywords (:holder/:figure/:ic) to integers
-//! before sending any JSON to this process.
+//! Share persistence: KeygenOutput is serialized via rmp-serde
+//! (MessagePack) and written to `share_path`. The fingerprint is the
+//! SHA-256 of those bytes, hex-encoded. The bb wrapper owns the
+//! handle-to-path mapping; this binary just writes where told.
+//!
+//! Participants are integer ids (`Participant::from(u32)`); the bb
+//! wrapper maps role keywords (:holder/:figure/:ic) to integers before
+//! sending any JSON to this process.
 
+use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use threshold_signatures::{
     ecdsa::Secp256K1Sha256,
@@ -54,6 +62,7 @@ enum Inbound {
         me: u32,
         peers: Vec<u32>,
         threshold: u32,
+        share_path: String,
     },
     ProtocolDeliver {
         ceremony_id: String,
@@ -110,6 +119,7 @@ fn run_keygen_ceremony(
     me: u32,
     peers: Vec<u32>,
     threshold: u32,
+    share_path: String,
     stdin: &mut impl BufRead,
     stdout: &mut io::StdoutLock<'_>,
 ) -> Result<()> {
@@ -185,7 +195,20 @@ fn run_keygen_ceremony(
                 // Public key as compressed sec1 bytes -> hex.
                 let pk_bytes = out.public_key.serialize().map_err(|e| anyhow!("{:?}", e))?;
                 let pk_hex = hex_encode(&pk_bytes);
-                let fp = share_fingerprint(&out);
+
+                // Persist the share. rmp-serde uses KeygenOutput's
+                // existing serde derives; SHA-256 over the bytes is
+                // the content fingerprint.
+                let share_bytes = rmp_serde::to_vec_named(&out)
+                    .context("rmp-serde encode of KeygenOutput")?;
+                let fp = sha256_hex(&share_bytes);
+                write_share(&share_path, &share_bytes)
+                    .with_context(|| format!("write share to {share_path}"))?;
+                log_stderr(role, &format!(
+                    "share written: {} bytes, fingerprint {fp} -> {share_path}",
+                    share_bytes.len()
+                ));
+
                 write_outbound(
                     stdout,
                     &Outbound::CeremonyComplete {
@@ -201,18 +224,23 @@ fn run_keygen_ceremony(
     }
 }
 
-fn share_fingerprint(_out: &KeygenOutput<Secp256K1Sha256>) -> String {
-    // Stage 2: a placeholder fingerprint. Real share persistence and
-    // content addressing arrive in Stage 3.
-    "stage2-stub-fingerprint".to_string()
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn write_share(path: &str, bytes: &[u8]) -> Result<()> {
+    let p = Path::new(path);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(p, bytes)?;
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    hex::encode(bytes)
 }
 
 // ---------- CLI ----------
@@ -253,12 +281,14 @@ fn main() -> Result<()> {
             me,
             peers,
             threshold,
+            share_path,
         } => run_keygen_ceremony(
             &role,
             ceremony_id,
             me,
             peers,
             threshold,
+            share_path,
             &mut stdin_lock,
             &mut stdout_lock,
         ),

@@ -31,29 +31,21 @@
    `opts` (all optional):
      :roles       — vector of role keywords; defaults to [:holder :figure :ic]
      :working-dir — absolute path to project root; auto-detected by default
-     :bb-task     — bb task name used for every role; defaults to \"null-party\"
-     :bb-tasks    — map of role → bb-task name; takes precedence over
-                    :bb-task for any role it contains. Used to mix party
-                    types in a single orchestrator (e.g. one bb-rust,
-                    two null at Stage 2)."
+     :bb-task     — bb task name used for every role; defaults to \"party\""
   ([] (start-orchestrator {}))
-  ([{:keys [roles working-dir bb-task bb-tasks]
-     :or   {roles    default-roles
-            bb-task  "null-party"
-            bb-tasks {}}}]
+  ([{:keys [roles working-dir bb-task]
+     :or   {roles   default-roles
+            bb-task "party"}}]
    (telemetry/ensure-initialized!)
    (let [wd (or working-dir (project-root))
          connections-by-role
          (into {}
-               (for [role roles
-                     :let [task (get bb-tasks role bb-task)]]
-                 [role (party/start! {:role role :working-dir wd :bb-task task})]))]
+               (for [role roles]
+                 [role (party/start! {:role role :working-dir wd :bb-task bb-task})]))]
      (log/log! {:level :info
                 :id    :mpc-multi-signature.orchestrator.core/started
                 :msg   "Orchestrator started"
-                :data  {:roles (vec roles)
-                        :tasks (into {} (for [r roles] [r (get bb-tasks r bb-task)]))
-                        :working-dir wd}})
+                :data  {:roles (vec roles) :bb-task bb-task :working-dir wd}})
      {:connections-by-role connections-by-role
       :working-dir         wd})))
 

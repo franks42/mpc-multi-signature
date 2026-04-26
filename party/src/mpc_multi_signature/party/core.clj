@@ -1,5 +1,6 @@
-(ns mpc-multi-signature.party.bb-rust
-  "Stage 2 bb wrapper: spawns the crypto-core Rust subprocess and
+(ns mpc-multi-signature.party.core
+  "The party-bb wrapper. Identical for all three roles; --role flag
+   selects the party. Spawns the crypto-core Rust subprocess and
    translates EDN (with the orchestrator) <-> JSON-Lines (with the
    Rust subprocess).
 
@@ -14,7 +15,7 @@
    - Binary protocol bodies stay base64 strings on both sides; this
      wrapper does not decode them.
 
-   Stage 2 scope: keygen only; protocol-relay forwarding both ways.
+   Stage 3 scope: keygen end-to-end with real shares and persistence.
    Sign and reshare arrive in later stages."
   (:require [cheshire.core :as json]
             [clojure.edn :as edn]
@@ -37,7 +38,7 @@
                                   (flush)))}}})
   (log/set-log-fn! (backend/get-log-fn))
   (log/log! {:level :info
-             :id    :mpc-multi-signature.party.bb-rust/started
+             :id    :mpc-multi-signature.party.core/started
              :data  {:role role}}))
 
 (defn- parse-args [args]
@@ -72,23 +73,34 @@
         pb  (doto (ProcessBuilder. [bin "--role" (name role)])
               (.redirectError ProcessBuilder$Redirect/INHERIT))]
     (log/log! {:level :info
-               :id    :mpc-multi-signature.party.bb-rust/spawning
+               :id    :mpc-multi-signature.party.core/spawning
                :data  {:role role :bin bin}})
     (.start pb)))
 
 ;; ---- JSON <-> EDN translation ----
 
+(defn- share-path
+  "Per-party share file path: <project-root>/<role>/shares/<handle>.bin.
+   Per the design doc, handle namespace is per-party."
+  [role handle-uuid]
+  (-> (System/getProperty "user.dir")
+      (java.io.File. (str (name role) "/shares/" handle-uuid ".bin"))
+      .getCanonicalPath))
+
 (defn- begin->json
-  "Translate an :ceremony/begin-keygen EDN map into the JSON map the
+  "Translate a :ceremony/begin-keygen EDN map into the JSON map the
    Rust binary expects. Uses `peers` (a vector of role keywords) to
-   map `me` and the integer-indexed peer list."
-  [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold]}]
+   map `me` and the integer-indexed peer list. Adds the per-party
+   share file path that the Rust binary writes its KeygenOutput to."
+  [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold]}
+   handle-uuid]
   (let [r->i (role->id-map peers)]
     {:msg_type    "begin_keygen"
      :ceremony_id (str id)
      :me          (get r->i me)
      :peers       (vec (range (count peers)))
-     :threshold   threshold}))
+     :threshold   threshold
+     :share_path  (share-path me handle-uuid)}))
 
 (defn- deliver->json
   "Translate a :protocol/deliver EDN map (from orchestrator) into the
@@ -154,8 +166,12 @@
 
 (defn- spawn-rust-reader-thread!
   "Read JSON-Lines from the Rust subprocess stdout, translate to EDN,
-   forward to the orchestrator (`out` = *out*)."
-  [role i->r ceremony-id-uuid handle-uuid rust-stdout out]
+   forward to the orchestrator (`out` = *out*). Sets `done?` when the
+   Rust process emits ceremony_complete or ceremony_error or its
+   stdout closes — after which the main loop drops late-arriving
+   :protocol/deliver messages per the chart's
+   :late-protocol-message-after-final cross-cutting rule."
+  [role i->r ceremony-id-uuid handle-uuid rust-stdout out done?]
   (let [reader (BufferedReader. (java.io.InputStreamReader. rust-stdout))]
     (doto (Thread. ^Runnable
            (fn []
@@ -167,12 +183,16 @@
                            edn (json->edn-out i->r ceremony-id-uuid handle-uuid m)]
                        (when edn
                          (send-edn! out edn))
+                       (when (#{"ceremony_complete" "ceremony_error"} (get m "msg_type"))
+                         (reset! done? true))
                        (recur)))))
                (catch Exception e
                  (log/log! {:level :error
-                            :id    :mpc-multi-signature.party.bb-rust/rust-reader-error
+                            :id    :mpc-multi-signature.party.core/rust-reader-error
                             :error e
-                            :data  {:role role}}))))
+                            :data  {:role role}}))
+               (finally
+                 (reset! done? true))))
                    (str "rust-reader-" (name role)))
       (.setDaemon true)
       (.start))))
@@ -187,11 +207,12 @@
         handle-uuid    (uuidv7/uuidv7)
         rust-process   (spawn-crypto-core! role)
         rust-stdin     (BufferedWriter. (java.io.OutputStreamWriter.
-                                         (.getOutputStream rust-process)))]
+                                         (.getOutputStream rust-process)))
+        done?          (atom false)]
     (spawn-rust-reader-thread! role i->r ceremony-id handle-uuid
-                               (.getInputStream rust-process) out-writer)
+                               (.getInputStream rust-process) out-writer done?)
     ;; Send begin to Rust.
-    (send-json! rust-stdin (begin->json begin-msg))
+    (send-json! rust-stdin (begin->json begin-msg handle-uuid))
     ;; Pump orchestrator stdin -> Rust stdin until EOF or cancel.
     (loop []
       (let [msg (try (edn/read {:eof ::eof} in-reader)
@@ -201,21 +222,34 @@
           (do (try (.close rust-stdin) (catch Exception _ nil))
               (.waitFor rust-process)
               (log/log! {:level :info
-                         :id    :mpc-multi-signature.party.bb-rust/ceremony-end
+                         :id    :mpc-multi-signature.party.core/ceremony-end
                          :data  {:role role :exit-code (.exitValue rust-process)}}))
 
           (= :protocol/deliver (:msg/type msg))
-          (do (send-json! rust-stdin (deliver->json r->i msg))
+          (do (if @done?
+                ;; Late-arriving protocol message after this party's
+                ;; ceremony already concluded — drop silently.
+                (log/log! {:level :debug
+                           :id    :mpc-multi-signature.party.core/late-deliver-dropped
+                           :data  {:role role
+                                   :ceremony-id (:ceremony/id msg)
+                                   :from (:protocol/from msg)}})
+                (try (send-json! rust-stdin (deliver->json r->i msg))
+                     (catch java.io.IOException _e
+                       ;; Race: Rust exited between @done? check and
+                       ;; the write. Treat as late-and-dropped.
+                       (reset! done? true))))
               (recur))
 
           (= :ceremony/cancel (:msg/type msg))
-          (do (send-json! rust-stdin (cancel->json msg))
+          (do (try (send-json! rust-stdin (cancel->json msg))
+                   (catch java.io.IOException _e nil))
               (try (.close rust-stdin) (catch Exception _ nil))
               (.waitFor rust-process))
 
           :else
           (do (log/log! {:level :warn
-                         :id    :mpc-multi-signature.party.bb-rust/unexpected-orchestrator-msg
+                         :id    :mpc-multi-signature.party.core/unexpected-orchestrator-msg
                          :data  {:role role :msg-type (:msg/type msg)}})
               (recur)))))))
 
@@ -225,7 +259,7 @@
   (let [{:keys [role]} (parse-args args)]
     (when-not role
       (binding [*out* *err*]
-        (println "Usage: bb bb-rust-party --role <holder|figure|ic>"))
+        (println "Usage: bb party --role <holder|figure|ic>"))
       (System/exit 1))
     (init-telemetry! role)
     (let [in-reader  (PushbackReader. *in*)
@@ -236,7 +270,7 @@
           (cond
             (= ::eof msg)
             (log/log! {:level :info
-                       :id    :mpc-multi-signature.party.bb-rust/eof
+                       :id    :mpc-multi-signature.party.core/eof
                        :data  {:role role}})
 
             (= :ceremony/begin-keygen (:msg/type msg))
@@ -245,6 +279,6 @@
 
             :else
             (do (log/log! {:level :warn
-                           :id    :mpc-multi-signature.party.bb-rust/pre-ceremony-msg
+                           :id    :mpc-multi-signature.party.core/pre-ceremony-msg
                            :data  {:role role :msg-type (:msg/type msg)}})
                 (recur))))))))
