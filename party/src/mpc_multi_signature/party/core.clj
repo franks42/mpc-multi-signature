@@ -50,14 +50,6 @@
       (= "--role" k) (recur (assoc acc :role (keyword v)) more)
       :else (recur acc (cons v more)))))
 
-;; ---- per-ceremony role-id mapping ----
-
-(defn- role->id-map [peers]
-  (into {} (map-indexed (fn [i r] [r i]) peers)))
-
-(defn- id->role-map [peers]
-  (into {} (map-indexed (fn [i r] [i r]) peers)))
-
 ;; ---- per-party artifact paths ----
 
 (defn- artifact-path
@@ -87,79 +79,75 @@
 
 ;; ---- EDN ↔ JSON translation: begin-* messages ----
 
+;; Each begin-X uses orchestrator-supplied :ceremony/participant-ids
+;; (a {role int} map) for me/peers translation. This map is the
+;; CANONICAL global role↔int registered at start-orchestrator time —
+;; stable across all ceremonies so threshold-signatures shares remain
+;; valid (they're bound to specific integer participant ids).
+
 (defn- begin-keygen->json
   [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold
-           :ceremony/share-handle]}]
-  (let [r->i (role->id-map peers)]
-    {:msg_type    "begin_keygen"
-     :ceremony_id (str id)
-     :me          (get r->i me)
-     :peers       (vec (range (count peers)))
-     :threshold   threshold
-     :share_path  (artifact-path me "shares" share-handle)}))
+           :ceremony/share-handle :ceremony/participant-ids]}]
+  {:msg_type    "begin_keygen"
+   :ceremony_id (str id)
+   :me          (get participant-ids me)
+   :peers       (mapv participant-ids peers)
+   :threshold   threshold
+   :share_path  (artifact-path me "shares" share-handle)})
 
 (defn- begin-triples->json
   [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold
-           :ceremony/triple-handle]}]
-  (let [r->i (role->id-map peers)]
-    {:msg_type    "begin_triples"
-     :ceremony_id (str id)
-     :me          (get r->i me)
-     :peers       (vec (range (count peers)))
-     :threshold   threshold
-     :triple_path (artifact-path me "triples" triple-handle)}))
+           :ceremony/triple-handle :ceremony/participant-ids]}]
+  {:msg_type    "begin_triples"
+   :ceremony_id (str id)
+   :me          (get participant-ids me)
+   :peers       (mapv participant-ids peers)
+   :threshold   threshold
+   :triple_path (artifact-path me "triples" triple-handle)})
 
 (defn- begin-presign->json
   [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold
-           :ceremony/share-handle :ceremony/triple-handle :ceremony/presig-handle]}]
-  (let [r->i (role->id-map peers)]
-    {:msg_type    "begin_presign"
-     :ceremony_id (str id)
-     :me          (get r->i me)
-     :peers       (vec (range (count peers)))
-     :threshold   threshold
-     :share_path  (artifact-path me "shares" share-handle)
-     :triple_path (artifact-path me "triples" triple-handle)
-     :presig_path (artifact-path me "presigs" presig-handle)}))
+           :ceremony/share-handle :ceremony/triple-handle :ceremony/presig-handle
+           :ceremony/participant-ids]}]
+  {:msg_type    "begin_presign"
+   :ceremony_id (str id)
+   :me          (get participant-ids me)
+   :peers       (mapv participant-ids peers)
+   :threshold   threshold
+   :share_path  (artifact-path me "shares" share-handle)
+   :triple_path (artifact-path me "triples" triple-handle)
+   :presig_path (artifact-path me "presigs" presig-handle)})
 
 (defn- begin-sign->json
   [{:keys [:ceremony/id :ceremony/me :ceremony/peers :ceremony/threshold
            :ceremony/coordinator :ceremony/share-handle :ceremony/presig-handle
-           :ceremony/digest-hex]}]
-  (let [r->i (role->id-map peers)]
-    {:msg_type    "begin_sign"
-     :ceremony_id (str id)
-     :me          (get r->i me)
-     :peers       (vec (range (count peers)))
-     :threshold   threshold
-     :coordinator (get r->i coordinator)
-     :share_path  (artifact-path me "shares" share-handle)
-     :presig_path (artifact-path me "presigs" presig-handle)
-     :digest_hex  digest-hex}))
+           :ceremony/digest-hex :ceremony/participant-ids]}]
+  {:msg_type    "begin_sign"
+   :ceremony_id (str id)
+   :me          (get participant-ids me)
+   :peers       (mapv participant-ids peers)
+   :threshold   threshold
+   :coordinator (get participant-ids coordinator)
+   :share_path  (artifact-path me "shares" share-handle)
+   :presig_path (artifact-path me "presigs" presig-handle)
+   :digest_hex  digest-hex})
 
 (defn- begin-reshare->json
   [{:keys [:ceremony/id :ceremony/me :ceremony/old-peers :ceremony/old-threshold
            :ceremony/new-peers :ceremony/new-threshold
            :ceremony/old-share-handle :ceremony/new-share-handle
-           :ceremony/public-key-hex]}]
-  ;; Both old and new participant lists need a shared integer-id space;
-  ;; we use the union, with new-peers taking precedence for duplicate
-  ;; roles. The Rust side validates internally.
-  (let [union   (vec (distinct (concat old-peers new-peers)))
-        r->i    (role->id-map union)
-        old-int (mapv #(get r->i %) old-peers)
-        new-int (mapv #(get r->i %) new-peers)]
-    {:msg_type        "begin_reshare"
-     :ceremony_id     (str id)
-     :me              (get r->i me)
-     :old_peers       old-int
-     :old_threshold   old-threshold
-     :new_peers       new-int
-     :new_threshold   new-threshold
-     :old_share_path  (when old-share-handle
-                        (artifact-path me "shares" old-share-handle))
-     :public_key_hex  public-key-hex
-     :new_share_path  (artifact-path me "shares" new-share-handle)}))
+           :ceremony/public-key-hex :ceremony/participant-ids]}]
+  {:msg_type        "begin_reshare"
+   :ceremony_id     (str id)
+   :me              (get participant-ids me)
+   :old_peers       (mapv participant-ids old-peers)
+   :old_threshold   old-threshold
+   :new_peers       (mapv participant-ids new-peers)
+   :new_threshold   new-threshold
+   :old_share_path  (when old-share-handle
+                      (artifact-path me "shares" old-share-handle))
+   :public_key_hex  public-key-hex
+   :new_share_path  (artifact-path me "shares" new-share-handle)})
 
 (defn- begin->json
   "Dispatch on :msg/type to the appropriate translator."
@@ -172,18 +160,15 @@
     :ceremony/begin-reshare  (begin-reshare->json msg)
     (throw (ex-info "Unknown begin-* message type" {:type (:msg/type msg)}))))
 
-(defn- begin-msg-peers
-  "Return the role-keyword peer list from a begin message — used to
-   build the role↔id mapping for the rest of the ceremony's messages.
-   For begin-reshare the ceremony's working participant set is the
-   new-peers (those who emit/receive protocol messages)."
+(defn- ceremony-participant-ids
+  "Pull the canonical {role int} map from a begin-* message. All
+   begin-* shapes carry it; we pluck consistently."
   [msg]
-  (case (:msg/type msg)
-    :ceremony/begin-reshare (vec (distinct (concat (:ceremony/old-peers msg)
-                                                   (:ceremony/new-peers msg))))
-    (:ceremony/peers msg)))
+  (:ceremony/participant-ids msg))
 
 (defn- deliver->json
+  "`r->i` is the canonical {role int} map carried on every begin
+   message — same map we use for me/peers translation."
   [r->i {:keys [:ceremony/id :protocol/from :protocol/body]}]
   {:msg_type    "protocol_deliver"
    :ceremony_id (str id)
@@ -285,9 +270,8 @@
                     ceremony finished (its Rust subprocess exited);
                     -main hands it to a fresh run-ceremony! invocation."
   [role begin-msg in-reader out-writer]
-  (let [peers          (begin-msg-peers begin-msg)
-        r->i           (role->id-map peers)
-        i->r           (id->role-map peers)
+  (let [r->i           (ceremony-participant-ids begin-msg)
+        i->r           (into {} (map (fn [[k v]] [v k])) r->i)
         ceremony-id    (:ceremony/id begin-msg)
         rust-process   (spawn-crypto-core! role)
         rust-stdin     (BufferedWriter. (java.io.OutputStreamWriter.

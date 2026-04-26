@@ -46,6 +46,12 @@
             bb-task "party"}}]
    (telemetry/ensure-initialized!)
    (let [wd (or working-dir (project-root))
+         ;; Canonical role↔int map: each role's participant-id is its
+         ;; index in the orchestrator's :roles vector. Stable across all
+         ;; ceremonies — the threshold-signatures crate's shares are
+         ;; bound to specific integer participant ids; if those drift
+         ;; between ceremonies, presign rejects with "incorrect shares".
+         participant-ids (into {} (map-indexed (fn [i r] [r i]) roles))
          connections-by-role
          (into {}
                (for [role roles]
@@ -53,8 +59,11 @@
      (log/log! {:level :info
                 :id    :mpc-multi-signature.orchestrator.core/started
                 :msg   "Orchestrator started"
-                :data  {:roles (vec roles) :bb-task bb-task :working-dir wd}})
+                :data  {:roles (vec roles) :bb-task bb-task
+                        :participant-ids participant-ids
+                        :working-dir wd}})
      {:connections-by-role connections-by-role
+      :participant-ids     participant-ids
       :working-dir         wd})))
 
 (defn keygen
