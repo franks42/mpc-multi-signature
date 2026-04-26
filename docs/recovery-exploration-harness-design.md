@@ -1214,3 +1214,226 @@ result. Modeling them as entry actions keeps the chart small.
 
 The chart will be refined during Stage 0.5 against the EDN vocabulary.
 This sketch is the seed, not the finished artifact.
+
+## Appendix E: Confidentiality and transport architecture (Stage 5+)
+
+Captures design decisions for the inter-party transport layer that the
+harness defers (per Appendix C) but production needs. Recorded
+2026-04-26 after a design discussion; concrete implementation is
+Stage 5+ work.
+
+### Message confidentiality
+
+Per `Action::SendPrivate` in the threshold-signatures crate's
+`Protocol` trait, the docstring is explicit: private messages MUST be
+encrypted in transit. Broadcasts (`SendMany`) are not secret by design
+(same bytes go to all peers). Our current harness routes both as
+plaintext base64; that's deliberately out-of-scope (Appendix C).
+
+Production approach: **end-to-end encrypted application-layer
+sessions via the Noise Protocol Framework (XK pattern).** Each party
+holds a static Curve25519 key; AKE at session start derives an
+ephemeral session key; messages are AEAD-wrapped (ChaCha20-Poly1305
+or AES-GCM).
+
+Why Noise over mutual TLS:
+
+- No PKI baggage (no CA management, no X.509).
+- Forward secrecy comes for free.
+- Mature support across ecosystems (`noise-rs`, JS Noise libs, Go).
+- Simple state machine.
+
+The trade-off: slightly less ubiquitous than TLS infrastructure for
+non-cryptographic devops staff to operate.
+
+Where this layer lives: **inside the bb wrapper**, between the
+orchestrator-facing EDN boundary and the crypto-core stdio. The
+wrapper:
+
+- Holds the long-term static identity key.
+- Establishes Noise sessions with peers at ceremony start.
+- AEAD-wraps `protocol_broadcast` / `protocol_private` bodies before
+  they leave the party; unwraps on receipt.
+- The orchestrator (or production coordinator party) routes opaque
+  bytes; the EDN contract is unchanged. Crypto-core is transparent
+  to the layer.
+
+This is exactly the substitutability the contract-first architecture
+was designed for: encryption slots in behind the bb-wrapper boundary
+without restructuring the orchestrator or crypto-core.
+
+### Three keys per party (deliberately separated)
+
+Production deployment introduces three distinct cryptographic
+identities per party. They MUST be separate cryptographic objects:
+
+1. **Identity signing key** (Ed25519, long-term). Authenticates
+   "I am Figure" / "I am the holder." Registered in
+   `:state/address-policy-registry` and possibly anchored on-chain.
+   Long rotation cycle. HSM-backed in production.
+
+2. **Transport encryption key** (X25519, possibly ephemeral session-
+   derived). For confidentiality of inter-party messages. signet's
+   Ed25519 ↔ X25519 birational conversion makes the same long-term
+   entropy reusable across both, OR fully separate keys if preferred.
+
+3. **MPC threshold share** (secp256k1 scalar). Wallet-specific share
+   of the threshold-signature key. Never leaves the party. Stored
+   per-wallet (per `:state/{role}-share-store`).
+
+These are completely orthogonal cryptographic objects with different
+storage requirements and rotation profiles. Mixing them creates
+classical anti-patterns (signature oracles becoming decryption
+oracles; Bleichenbacher-style attacks).
+
+signet 0.4.0 already provides (1) and (2); the threshold-signatures
+crate provides (3). The split is "free" in our codebase.
+
+### Bootstrap trust
+
+Two complementary mechanisms, both used together for YLDS:
+
+1. **Onboarding-as-bootstrap.** Figure's existing KYC and contract
+   onboarding establish initial pubkey bindings out-of-band. Each
+   party stores peers' static Ed25519 pubkeys after onboarding. This
+   reuses the trust establishment YLDS already mandates for
+   regulatory reasons.
+
+2. **On-chain anchor.** At wallet creation, the
+   `:state/address-policy-registry` entry includes peers' identity
+   pubkeys, anchored on Provenance Blockchain. Recovery and divorce
+   ceremonies verify peer pubkeys against the on-chain anchor —
+   gives a cryptographic root of trust independent of any one party.
+
+Combination property: a compromised Figure cannot rewrite peer
+identities (chain anchor); but the chain anchor reuses Figure's
+KYC-established pubkeys (bootstrap reuse). Belt and suspenders.
+
+### On-disk state confidentiality
+
+All persisted state in `<role>/{shares,triples,presigs}/<handle>.bin`
+contains secret material today (rmp-serde plaintext). Production
+substitutes encryption-at-rest, OS keyring, HSM, or TEE-backed storage
+at the bb-wrapper boundary. The `<role, handle>` API stays unchanged;
+only the storage backend changes.
+
+## Appendix F: Share-possession proofs and identity-share binding (Stage 5+)
+
+Two related cryptographic primitives that production deployment will
+need. Recorded 2026-04-26; Stage 5+ implementation. Both are small
+additions with large architectural payoff.
+
+### Share-possession proof
+
+A standard Schnorr proof of knowledge over the per-party verification
+share `X_i = x_i · G` — proves a holder controls their secret share
+without producing a real signature.
+
+```
+Prover (holds x_i)              Verifier (knows X_i)
+──────────────────              ────────────────────
+pick random r ∈ Z_n
+R = r · G
+                  ─── R ──────►
+                                 pick challenge c
+                  ◄── c ──────
+s = r + c · x_i
+                  ─── s ──────►
+                                 check s · G == R + c · X_i
+```
+
+Made non-interactive via Fiat-Shamir: `c = H(R || X_i || context)`.
+Standard ~30 LOC of EC arithmetic on secp256k1.
+
+**Distinct from "show that a multi-sig works":**
+
+- Signing produces a real ECDSA signature → has consequences (commits
+  the wallet, the bytes can be replayed in unintended contexts).
+- PoK doesn't produce signature bytes → no replay risk in other
+  contexts (with proper context binding).
+- PoK is single-party, async → does not require ≥t parties online.
+- PoK is free → does not consume a presignature.
+
+Use cases unlocking from this primitive:
+
+- **Aliveness check** before structural ceremonies — catches "share
+  lost" failures before committing to a deadline-bound reshare.
+- **IC onboarding** — Figure proves share-possession to IC.
+- **Compliance / audit** — regulator-facing attestation that all
+  designated share-holders are still in possession, without producing
+  any real signatures.
+- **Recovery-policy pre-gates** — surviving parties prove share-
+  possession before initiating reshare.
+- **Periodic share-health probe** — heartbeat-style, async,
+  cheap.
+
+The threshold-signatures crate's `PublicKeyPackage` exposes
+verification shares; we'd propagate them through crypto-core's keygen
+result up to the orchestrator's `:state/address-policy-registry`
+entry.
+
+This is a new ceremony: `:ceremony/share-possession-proof`. Single-
+party, no protocol relay. Slots in alongside
+`:ceremony/attestation-issuance`.
+
+### Identity-share binding proof
+
+Combined proof that one entity holds **both** a registered Ed25519
+identity key AND a registered MPC share. Welds the two cryptographic
+identities into a single verifiable transcript.
+
+Construction (matching our existing primitives):
+
+A Schnorr PoK of `x_i` with the Fiat-Shamir challenge derived from
+both the verification share AND the Ed25519 identity key:
+
+```
+c = H(R || X_i || K_id_pub || verifier_nonce || ceremony_context)
+s = r + c · x_i
+```
+
+The PoK is then signed with the Ed25519 identity key. Verifier checks
+both the signature (against `K_id_pub`) and the PoK (against `X_i`).
+
+**Critical property — non-transferability.** The Fiat-Shamir hash
+bakes `K_id_pub` into `c`, so the PoK is locked to "the entity
+controlling K_id_pub asserts that they control x_i." Without this
+binding, Alice could intercept Bob's PoK and replay it under her own
+identity.
+
+What this unlocks (defense-in-depth):
+
+- **Identity key compromise alone is insufficient** for MPC
+  impersonation — attacker also needs the share (which is offline for
+  IC most of the time).
+- **Share compromise alone is insufficient** for identity-gated
+  impersonation — attacker also needs the Ed25519 key.
+- Compromise must include **both**, which is logically stronger.
+
+Especially well-aligned with the offline-IC pattern: IC's Ed25519 key
+can be online (handshakes, attestation issuance) while their share
+stays offline. An attacker compromising only the online endpoint
+fails the binding proof.
+
+Production uses:
+
+- **Ceremony handshake authenticator.** Every ceremony begins with
+  each party producing a binding proof — cheap, async. Catches "valid
+  identity but invalid share" mismatches before committing to a
+  ceremony.
+- **Noise session AKE augmentation.** The resulting session key is
+  bound not just to the identity key, but to "identity AND share" —
+  stronger session security.
+- **Reshare validation.** New participants demonstrate their identity
+  binds to their fresh post-reshare share.
+- **Audit / compliance attestation** combining identity and
+  share-possession in one transcript.
+
+Implementation cost: ~50 LOC crypto-core (Schnorr-on-secp256k1) + ~30
+LOC orchestrator (verify helper using signet for the Ed25519 sig + the
+Schnorr verifier). Doesn't change the EDN or statechart contract.
+
+**Stage 5 must-have**, not optional: small primitive, large
+architectural payoff. The two-layer cryptographic gate it enables is
+the right trust foundation for YLDS-scale regulatory contexts.
+
