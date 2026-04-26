@@ -8,31 +8,33 @@
 //! Wire format (mirrors the design doc Appendix B):
 //!
 //!   inbound stdin (one JSON object per line):
-//!     {"msg_type":"begin_keygen","ceremony_id":"<uuid>","me":0,
-//!      "peers":[0,1,2],"threshold":2,
-//!      "share_path":"/abs/path/to/<role>/shares/<handle>.bin"}
-//!     {"msg_type":"protocol_deliver","ceremony_id":"<uuid>",
-//!      "from":<int>,"body":"<base64>"}
-//!     {"msg_type":"cancel","ceremony_id":"<uuid>"}
+//!     {"msg_type":"begin_keygen", "ceremony_id":"<uuid>", "me":0,
+//!      "peers":[0,1,2], "threshold":2,
+//!      "share_path":"/abs/path/<role>/shares/<handle>.bin"}
+//!     {"msg_type":"begin_triples", ..., "triple_path":"..."}
+//!     {"msg_type":"begin_presign", ..., "share_path":"...", "triple_path":"...",
+//!      "presig_path":"..."}
+//!     {"msg_type":"begin_sign", ..., "coordinator":<int>, "share_path":"...",
+//!      "presig_path":"...", "digest_hex":"<32-byte hex>"}
+//!     {"msg_type":"begin_reshare", "old_peers":[...], "old_threshold":N,
+//!      "new_peers":[...], "new_threshold":M, "me":<int>,
+//!      "old_share_path":<string|null>, "public_key_hex":"<hex>",
+//!      "new_share_path":"..."}
+//!     {"msg_type":"protocol_deliver", ..., "from":<int>, "body":"<base64>"}
+//!     {"msg_type":"cancel", "ceremony_id":"..."}
 //!
 //!   outbound stdout (one JSON object per line):
-//!     {"msg_type":"protocol_broadcast","ceremony_id":"<uuid>",
-//!      "from":<int>,"body":"<base64>"}
-//!     {"msg_type":"protocol_private","ceremony_id":"<uuid>",
-//!      "from":<int>,"to":<int>,"body":"<base64>"}
-//!     {"msg_type":"ceremony_complete","ceremony_id":"<uuid>",
-//!      "public_key_hex":"<hex>","share_fingerprint":"<hex>"}
-//!     {"msg_type":"ceremony_error","ceremony_id":"<uuid>",
-//!      "category":"<string>","message":"<string>"}
+//!     {"msg_type":"protocol_broadcast", ..., "from":<int>, "body":"<base64>"}
+//!     {"msg_type":"protocol_private",   ..., "from":<int>, "to":<int>, "body":"<base64>"}
+//!     {"msg_type":"ceremony_complete",  ..., "result": <ceremony-specific JSON map>}
+//!     {"msg_type":"ceremony_error",     ..., "category":"...", "message":"..."}
 //!
-//! Share persistence: KeygenOutput is serialized via rmp-serde
-//! (MessagePack) and written to `share_path`. The fingerprint is the
-//! SHA-256 of those bytes, hex-encoded. The bb wrapper owns the
-//! handle-to-path mapping; this binary just writes where told.
-//!
-//! Participants are integer ids (`Participant::from(u32)`); the bb
-//! wrapper maps role keywords (:holder/:figure/:ic) to integers before
-//! sending any JSON to this process.
+//! Persistence: rmp-serde encoded blobs.
+//!   shares:  KeygenOutput<Secp256K1Sha256>
+//!   triples: Vec<(TripleShare, TriplePub)> (length 2 — both triples for one signature)
+//!   presigs: PresignOutput
+//! Each ceremony reads its inputs from disk, writes its output to
+//! disk, returns a content-hash fingerprint as the handle.
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -44,12 +46,25 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use elliptic_curve::ff::PrimeField;
+use elliptic_curve::sec1::ToEncodedPoint;
+use k256::AffinePoint;
+
 use threshold_signatures::{
-    ecdsa::Secp256K1Sha256,
+    ecdsa::{
+        ot_based_ecdsa::{
+            presign::presign,
+            sign::sign,
+            triples::{generate_triple_many, TriplePub, TripleShare},
+            PresignArguments, PresignOutput, RerandomizedPresignOutput,
+        },
+        RerandomizationArguments, Scalar as EcdsaScalar, Secp256K1Sha256, Signature, Tweak,
+    },
+    frost_secp256k1::VerifyingKey,
     keygen,
     participants::Participant,
     protocol::{Action, Protocol},
-    KeygenOutput, ReconstructionLowerBound,
+    reshare, KeygenOutput, ParticipantList, ReconstructionLowerBound,
 };
 
 // ---------- Wire types ----------
@@ -63,6 +78,43 @@ enum Inbound {
         peers: Vec<u32>,
         threshold: u32,
         share_path: String,
+    },
+    BeginTriples {
+        ceremony_id: String,
+        me: u32,
+        peers: Vec<u32>,
+        threshold: u32,
+        triple_path: String,
+    },
+    BeginPresign {
+        ceremony_id: String,
+        me: u32,
+        peers: Vec<u32>,
+        threshold: u32,
+        share_path: String,
+        triple_path: String,
+        presig_path: String,
+    },
+    BeginSign {
+        ceremony_id: String,
+        me: u32,
+        peers: Vec<u32>,
+        threshold: u32,
+        coordinator: u32,
+        share_path: String,
+        presig_path: String,
+        digest_hex: String,
+    },
+    BeginReshare {
+        ceremony_id: String,
+        me: u32,
+        old_peers: Vec<u32>,
+        old_threshold: u32,
+        new_peers: Vec<u32>,
+        new_threshold: u32,
+        old_share_path: Option<String>,
+        public_key_hex: String,
+        new_share_path: String,
     },
     ProtocolDeliver {
         ceremony_id: String,
@@ -90,8 +142,7 @@ enum Outbound {
     },
     CeremonyComplete {
         ceremony_id: String,
-        public_key_hex: String,
-        share_fingerprint: String,
+        result: serde_json::Value,
     },
     CeremonyError {
         ceremony_id: String,
@@ -111,33 +162,44 @@ fn log_stderr(role: &str, msg: &str) {
     eprintln!("[mpc-crypto-core role={role}] {msg}");
 }
 
-// ---------- Keygen driver ----------
+// ---------- Persistence helpers ----------
 
-fn run_keygen_ceremony(
+fn write_blob(path: &str, bytes: &[u8]) -> Result<()> {
+    let p = Path::new(path);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(p, bytes)?;
+    Ok(())
+}
+
+fn read_blob(path: &str) -> Result<Vec<u8>> {
+    Ok(fs::read(path).with_context(|| format!("read {path}"))?)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+// ---------- Generic protocol driver ----------
+
+/// Drive a Protocol to completion via JSON-Lines stdio. The orchestrator
+/// (via the bb wrapper) routes protocol_broadcast/protocol_private
+/// messages between parties; we encode/decode the opaque MessageData as
+/// base64.
+fn drive_protocol<T>(
     role: &str,
-    ceremony_id: String,
+    ceremony_id: &str,
     me: u32,
-    peers: Vec<u32>,
-    threshold: u32,
-    share_path: String,
+    mut protocol: Box<dyn Protocol<Output = T>>,
     stdin: &mut impl BufRead,
     stdout: &mut io::StdoutLock<'_>,
-) -> Result<()> {
-    let participants: Vec<Participant> = peers.iter().copied().map(Participant::from).collect();
-    let me_p = Participant::from(me);
-    let threshold_lb = ReconstructionLowerBound::from(threshold as usize);
-
-    let mut protocol: Box<dyn Protocol<Output = KeygenOutput<Secp256K1Sha256>>> = Box::new(
-        keygen::<Secp256K1Sha256>(&participants, me_p, threshold_lb, OsRng)
-            .map_err(|e| anyhow!("keygen init failed: {:?}", e))?,
-    );
-
-    log_stderr(role, &format!("keygen initialized: me={me} peers={peers:?} threshold={threshold}"));
-
+) -> Result<T> {
     loop {
         match protocol.poke().map_err(|e| anyhow!("protocol poke: {:?}", e))? {
             Action::Wait => {
-                // Block on next stdin message.
                 let mut line = String::new();
                 let n = stdin.read_line(&mut line)?;
                 if n == 0 {
@@ -162,10 +224,10 @@ fn run_keygen_ceremony(
                     }
                     Inbound::Cancel { ceremony_id: cid } => {
                         log_stderr(role, &format!("cancel received during protocol (ceremony {cid})"));
-                        return Ok(());
+                        return Err(anyhow!("ceremony cancelled"));
                     }
-                    Inbound::BeginKeygen { .. } => {
-                        return Err(anyhow!("unexpected begin_keygen mid-protocol"));
+                    other => {
+                        return Err(anyhow!("unexpected message mid-protocol: {other:?}"));
                     }
                 }
             }
@@ -173,7 +235,7 @@ fn run_keygen_ceremony(
                 write_outbound(
                     stdout,
                     &Outbound::ProtocolBroadcast {
-                        ceremony_id: ceremony_id.clone(),
+                        ceremony_id: ceremony_id.to_string(),
                         from: me,
                         body: B64.encode(&data),
                     },
@@ -184,63 +246,378 @@ fn run_keygen_ceremony(
                 write_outbound(
                     stdout,
                     &Outbound::ProtocolPrivate {
-                        ceremony_id: ceremony_id.clone(),
+                        ceremony_id: ceremony_id.to_string(),
                         from: me,
                         to: to_u32,
                         body: B64.encode(&data),
                     },
                 )?;
             }
-            Action::Return(out) => {
-                // Public key as compressed sec1 bytes -> hex.
-                let pk_bytes = out.public_key.serialize().map_err(|e| anyhow!("{:?}", e))?;
-                let pk_hex = hex_encode(&pk_bytes);
-
-                // Persist the share. rmp-serde uses KeygenOutput's
-                // existing serde derives; SHA-256 over the bytes is
-                // the content fingerprint.
-                let share_bytes = rmp_serde::to_vec_named(&out)
-                    .context("rmp-serde encode of KeygenOutput")?;
-                let fp = sha256_hex(&share_bytes);
-                write_share(&share_path, &share_bytes)
-                    .with_context(|| format!("write share to {share_path}"))?;
-                log_stderr(role, &format!(
-                    "share written: {} bytes, fingerprint {fp} -> {share_path}",
-                    share_bytes.len()
-                ));
-
-                write_outbound(
-                    stdout,
-                    &Outbound::CeremonyComplete {
-                        ceremony_id: ceremony_id.clone(),
-                        public_key_hex: pk_hex,
-                        share_fingerprint: fp,
-                    },
-                )?;
-                log_stderr(role, "keygen complete");
-                return Ok(());
-            }
+            Action::Return(out) => return Ok(out),
         }
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
+// ---------- Ceremony handlers ----------
 
-fn write_share(path: &str, bytes: &[u8]) -> Result<()> {
-    let p = Path::new(path);
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(p, bytes)?;
+fn handle_keygen(
+    role: &str,
+    ceremony_id: String,
+    me: u32,
+    peers: Vec<u32>,
+    threshold: u32,
+    share_path: String,
+    stdin: &mut impl BufRead,
+    stdout: &mut io::StdoutLock<'_>,
+) -> Result<()> {
+    let participants: Vec<Participant> = peers.iter().copied().map(Participant::from).collect();
+    let me_p = Participant::from(me);
+    let threshold_lb = ReconstructionLowerBound::from(threshold as usize);
+
+    let proto: Box<dyn Protocol<Output = KeygenOutput<Secp256K1Sha256>>> = Box::new(
+        keygen::<Secp256K1Sha256>(&participants, me_p, threshold_lb, OsRng)
+            .map_err(|e| anyhow!("keygen init: {:?}", e))?,
+    );
+    log_stderr(role, &format!("keygen me={me} peers={peers:?} threshold={threshold}"));
+
+    let out = drive_protocol(role, &ceremony_id, me, proto, stdin, stdout)?;
+
+    let pk_bytes = out.public_key.serialize().map_err(|e| anyhow!("{:?}", e))?;
+    let pk_hex = hex::encode(&pk_bytes);
+    let share_bytes = rmp_serde::to_vec_named(&out).context("rmp-serde encode KeygenOutput")?;
+    let fp = sha256_hex(&share_bytes);
+    write_blob(&share_path, &share_bytes)?;
+
+    log_stderr(role, &format!("keygen complete: pk={pk_hex} share={share_path}"));
+    write_outbound(
+        stdout,
+        &Outbound::CeremonyComplete {
+            ceremony_id,
+            result: serde_json::json!({
+                "public_key_hex":  pk_hex,
+                "share_fingerprint": fp,
+                "share_path": share_path,
+            }),
+        },
+    )?;
     Ok(())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    hex::encode(bytes)
+fn handle_triples(
+    role: &str,
+    ceremony_id: String,
+    me: u32,
+    peers: Vec<u32>,
+    threshold: u32,
+    triple_path: String,
+    stdin: &mut impl BufRead,
+    stdout: &mut io::StdoutLock<'_>,
+) -> Result<()> {
+    let participants: Vec<Participant> = peers.iter().copied().map(Participant::from).collect();
+    let me_p = Participant::from(me);
+    let threshold_lb = ReconstructionLowerBound::from(threshold as usize);
+
+    let proto: Box<dyn Protocol<Output = Vec<(TripleShare, TriplePub)>>> = Box::new(
+        generate_triple_many::<2>(&participants, me_p, threshold_lb, OsRng)
+            .map_err(|e| anyhow!("triple-gen init: {:?}", e))?,
+    );
+    log_stderr(role, &format!("triple-gen me={me} peers={peers:?} threshold={threshold} (×2)"));
+
+    let triples = drive_protocol(role, &ceremony_id, me, proto, stdin, stdout)?;
+
+    if triples.len() != 2 {
+        return Err(anyhow!("expected 2 triples, got {}", triples.len()));
+    }
+    let bytes = rmp_serde::to_vec_named(&triples).context("rmp-serde encode triples")?;
+    let fp = sha256_hex(&bytes);
+    write_blob(&triple_path, &bytes)?;
+
+    log_stderr(role, &format!("triples complete: {triple_path}"));
+    write_outbound(
+        stdout,
+        &Outbound::CeremonyComplete {
+            ceremony_id,
+            result: serde_json::json!({
+                "triple_fingerprint": fp,
+                "triple_path": triple_path,
+            }),
+        },
+    )?;
+    Ok(())
+}
+
+fn handle_presign(
+    role: &str,
+    ceremony_id: String,
+    me: u32,
+    peers: Vec<u32>,
+    threshold: u32,
+    share_path: String,
+    triple_path: String,
+    presig_path: String,
+    stdin: &mut impl BufRead,
+    stdout: &mut io::StdoutLock<'_>,
+) -> Result<()> {
+    let participants: Vec<Participant> = peers.iter().copied().map(Participant::from).collect();
+    let me_p = Participant::from(me);
+    let threshold_lb = ReconstructionLowerBound::from(threshold as usize);
+
+    let keygen_bytes = read_blob(&share_path)?;
+    let keygen_out: KeygenOutput<Secp256K1Sha256> =
+        rmp_serde::from_slice(&keygen_bytes).context("decode KeygenOutput")?;
+
+    let triple_bytes = read_blob(&triple_path)?;
+    let triples: Vec<(TripleShare, TriplePub)> =
+        rmp_serde::from_slice(&triple_bytes).context("decode triples")?;
+    if triples.len() != 2 {
+        return Err(anyhow!("expected 2 triples on disk, got {}", triples.len()));
+    }
+    let mut iter = triples.into_iter();
+    let triple0 = iter.next().unwrap();
+    let triple1 = iter.next().unwrap();
+
+    let proto: Box<dyn Protocol<Output = PresignOutput>> = Box::new(
+        presign(
+            &participants,
+            me_p,
+            PresignArguments {
+                triple0,
+                triple1,
+                keygen_out,
+                threshold: threshold_lb,
+            },
+        )
+        .map_err(|e| anyhow!("presign init: {:?}", e))?,
+    );
+    log_stderr(role, &format!("presign me={me} peers={peers:?}"));
+
+    let presig = drive_protocol(role, &ceremony_id, me, proto, stdin, stdout)?;
+
+    let bytes = rmp_serde::to_vec_named(&presig).context("rmp-serde encode PresignOutput")?;
+    let fp = sha256_hex(&bytes);
+    write_blob(&presig_path, &bytes)?;
+
+    log_stderr(role, &format!("presign complete: {presig_path}"));
+    write_outbound(
+        stdout,
+        &Outbound::CeremonyComplete {
+            ceremony_id,
+            result: serde_json::json!({
+                "presig_fingerprint": fp,
+                "presig_path": presig_path,
+            }),
+        },
+    )?;
+    Ok(())
+}
+
+fn handle_sign(
+    role: &str,
+    ceremony_id: String,
+    me: u32,
+    peers: Vec<u32>,
+    threshold: u32,
+    coordinator: u32,
+    share_path: String,
+    presig_path: String,
+    digest_hex: String,
+    stdin: &mut impl BufRead,
+    stdout: &mut io::StdoutLock<'_>,
+) -> Result<()> {
+    let participants: Vec<Participant> = peers.iter().copied().map(Participant::from).collect();
+    let me_p = Participant::from(me);
+    let coord_p = Participant::from(coordinator);
+    let threshold_lb = ReconstructionLowerBound::from(threshold as usize);
+
+    // Load the keygen output (for public_key) and the presignature.
+    let keygen_bytes = read_blob(&share_path)?;
+    let keygen_out: KeygenOutput<Secp256K1Sha256> =
+        rmp_serde::from_slice(&keygen_bytes).context("decode KeygenOutput")?;
+    let presig_bytes = read_blob(&presig_path)?;
+    let presig: PresignOutput =
+        rmp_serde::from_slice(&presig_bytes).context("decode PresignOutput")?;
+
+    // Decode the 32-byte digest from hex.
+    let digest = hex::decode(&digest_hex).context("digest hex decode")?;
+    if digest.len() != 32 {
+        return Err(anyhow!("digest must be 32 bytes, got {}", digest.len()));
+    }
+    let mut digest32 = [0u8; 32];
+    digest32.copy_from_slice(&digest);
+    let msg_hash: EcdsaScalar = EcdsaScalar::from_repr(digest32.into())
+        .into_option()
+        .ok_or_else(|| anyhow!("digest not a valid secp256k1 scalar"))?;
+
+    // Rerandomize the presignature with a zero tweak — derived_pk = pk,
+    // so the resulting signature still verifies against the original pk.
+    // For Stage 4 we use deterministic zero entropy; production deployments
+    // would supply fresh entropy per signature.
+    let pk_affine: AffinePoint = keygen_out.public_key.to_element().to_affine();
+    let zero_tweak = Tweak::new(EcdsaScalar::ZERO);
+    let participant_list = ParticipantList::new(&participants)
+        .ok_or_else(|| anyhow!("invalid participant list"))?;
+    let rerand_args = RerandomizationArguments::new(
+        pk_affine,
+        zero_tweak,
+        digest32,
+        presig.big_r,
+        participant_list,
+        [0u8; 32], // entropy — Stage 4 deterministic; production needs fresh
+    );
+    let rerand_presig = RerandomizedPresignOutput::rerandomize_presign(&presig, &rerand_args)
+        .map_err(|e| anyhow!("rerandomize: {:?}", e))?;
+
+    let proto: Box<dyn Protocol<Output = Option<Signature>>> = Box::new(
+        sign(
+            &participants,
+            coord_p,
+            threshold_lb,
+            me_p,
+            pk_affine,
+            rerand_presig,
+            msg_hash,
+        )
+        .map_err(|e| anyhow!("sign init: {:?}", e))?,
+    );
+    log_stderr(role, &format!("sign me={me} peers={peers:?} coordinator={coordinator}"));
+
+    let sig_option = drive_protocol(role, &ceremony_id, me, proto, stdin, stdout)?;
+
+    // Coordinator gets Some(sig); others get None.
+    let result = match sig_option {
+        Some(sig) => {
+            // Convert (big_r, s) → standard (r, s) for interop. r is x-coord of big_r.
+            let r_scalar = scalar_x_of(&sig.big_r);
+            let r_bytes: [u8; 32] = r_scalar.to_repr().into();
+            let s_bytes: [u8; 32] = sig.s.to_repr().into();
+            let mut raw64 = [0u8; 64];
+            raw64[..32].copy_from_slice(&r_bytes);
+            raw64[32..].copy_from_slice(&s_bytes);
+            serde_json::json!({
+                "signature_hex": hex::encode(raw64),
+                "is_coordinator": true,
+            })
+        }
+        None => serde_json::json!({
+            "signature_hex": serde_json::Value::Null,
+            "is_coordinator": false,
+        }),
+    };
+
+    log_stderr(role, "sign complete");
+    write_outbound(
+        stdout,
+        &Outbound::CeremonyComplete {
+            ceremony_id,
+            result,
+        },
+    )?;
+    Ok(())
+}
+
+fn handle_reshare(
+    role: &str,
+    ceremony_id: String,
+    me: u32,
+    old_peers: Vec<u32>,
+    old_threshold: u32,
+    new_peers: Vec<u32>,
+    new_threshold: u32,
+    old_share_path: Option<String>,
+    public_key_hex: String,
+    new_share_path: String,
+    stdin: &mut impl BufRead,
+    stdout: &mut io::StdoutLock<'_>,
+) -> Result<()> {
+    let old_participants: Vec<Participant> =
+        old_peers.iter().copied().map(Participant::from).collect();
+    let new_participants: Vec<Participant> =
+        new_peers.iter().copied().map(Participant::from).collect();
+    let me_p = Participant::from(me);
+    let old_t = ReconstructionLowerBound::from(old_threshold as usize);
+    let new_t = ReconstructionLowerBound::from(new_threshold as usize);
+
+    // Old signing share: Some for old participants, None for new-only participants.
+    let old_signing_key = match old_share_path.as_deref() {
+        Some(p) => {
+            let bytes = read_blob(p)?;
+            let kg: KeygenOutput<Secp256K1Sha256> =
+                rmp_serde::from_slice(&bytes).context("decode old KeygenOutput")?;
+            Some(kg.private_share)
+        }
+        None => None,
+    };
+
+    // Old public key — required as continuity anchor.
+    let pk_bytes = hex::decode(&public_key_hex).context("public_key_hex decode")?;
+    let old_public_key: VerifyingKey =
+        VerifyingKey::deserialize(&pk_bytes).map_err(|e| anyhow!("decode pk: {:?}", e))?;
+
+    let proto: Box<dyn Protocol<Output = KeygenOutput<Secp256K1Sha256>>> = Box::new(
+        reshare::<Secp256K1Sha256>(
+            &old_participants,
+            old_t,
+            old_signing_key,
+            old_public_key,
+            &new_participants,
+            new_t,
+            me_p,
+            OsRng,
+        )
+        .map_err(|e| anyhow!("reshare init: {:?}", e))?,
+    );
+    log_stderr(
+        role,
+        &format!("reshare me={me} old={old_peers:?}/{old_threshold} new={new_peers:?}/{new_threshold}"),
+    );
+
+    let new_kg = drive_protocol(role, &ceremony_id, me, proto, stdin, stdout)?;
+
+    let new_pk_bytes = new_kg.public_key.serialize().map_err(|e| anyhow!("{:?}", e))?;
+    let new_pk_hex = hex::encode(&new_pk_bytes);
+    let bytes = rmp_serde::to_vec_named(&new_kg).context("rmp-serde encode KeygenOutput")?;
+    let fp = sha256_hex(&bytes);
+    write_blob(&new_share_path, &bytes)?;
+
+    if new_pk_hex != public_key_hex {
+        // Sanity: reshare must preserve the public key.
+        return Err(anyhow!(
+            "reshare PK changed! expected {public_key_hex} got {new_pk_hex}"
+        ));
+    }
+
+    log_stderr(role, &format!("reshare complete: pk preserved, share={new_share_path}"));
+    write_outbound(
+        stdout,
+        &Outbound::CeremonyComplete {
+            ceremony_id,
+            result: serde_json::json!({
+                "public_key_hex": new_pk_hex,
+                "share_fingerprint": fp,
+                "share_path": new_share_path,
+            }),
+        },
+    )?;
+    Ok(())
+}
+
+// ---------- secp256k1 x-coordinate helper ----------
+//
+// The threshold-signatures crate's `x_coordinate(&AffinePoint) -> Scalar`
+// is `pub(crate)`, not exposed. Re-implement using the public k256 API:
+// the affine x-coordinate, reduced modulo the curve order. Standard
+// ECDSA spec: r = x mod n.
+fn scalar_x_of(p: &AffinePoint) -> EcdsaScalar {
+    let enc = p.to_encoded_point(false); // uncompressed → has explicit x
+    let x_bytes = enc.x().expect("point is not at infinity");
+    let arr: [u8; 32] = (*x_bytes).into();
+    EcdsaScalar::from_repr(arr.into())
+        .into_option()
+        .unwrap_or_else(|| {
+            // x ≥ curve order — astronomically rare; panic with a hint
+            // since the spike doesn't need to handle this case for Stage 4.
+            panic!("affine x ≥ curve order — non-canonical r; explicit reduction TODO")
+        })
 }
 
 // ---------- CLI ----------
@@ -268,21 +645,21 @@ fn main() -> Result<()> {
     let stdout = io::stdout();
     let mut stdout_lock = stdout.lock();
 
-    // First inbound message must be begin_keygen for Stage 2.
     let mut first_line = String::new();
     let n = stdin_lock.read_line(&mut first_line)?;
     if n == 0 {
-        return Err(anyhow!("stdin closed before begin_keygen"));
+        return Err(anyhow!("stdin closed before begin_*"));
     }
     let first: Inbound = serde_json::from_str(first_line.trim())?;
-    let result = match first {
+
+    let result: Result<()> = match first {
         Inbound::BeginKeygen {
             ceremony_id,
             me,
             peers,
             threshold,
             share_path,
-        } => run_keygen_ceremony(
+        } => handle_keygen(
             &role,
             ceremony_id,
             me,
@@ -292,13 +669,97 @@ fn main() -> Result<()> {
             &mut stdin_lock,
             &mut stdout_lock,
         ),
-        other => Err(anyhow!("first message must be begin_keygen, got {other:?}")),
+
+        Inbound::BeginTriples {
+            ceremony_id,
+            me,
+            peers,
+            threshold,
+            triple_path,
+        } => handle_triples(
+            &role,
+            ceremony_id,
+            me,
+            peers,
+            threshold,
+            triple_path,
+            &mut stdin_lock,
+            &mut stdout_lock,
+        ),
+
+        Inbound::BeginPresign {
+            ceremony_id,
+            me,
+            peers,
+            threshold,
+            share_path,
+            triple_path,
+            presig_path,
+        } => handle_presign(
+            &role,
+            ceremony_id,
+            me,
+            peers,
+            threshold,
+            share_path,
+            triple_path,
+            presig_path,
+            &mut stdin_lock,
+            &mut stdout_lock,
+        ),
+
+        Inbound::BeginSign {
+            ceremony_id,
+            me,
+            peers,
+            threshold,
+            coordinator,
+            share_path,
+            presig_path,
+            digest_hex,
+        } => handle_sign(
+            &role,
+            ceremony_id,
+            me,
+            peers,
+            threshold,
+            coordinator,
+            share_path,
+            presig_path,
+            digest_hex,
+            &mut stdin_lock,
+            &mut stdout_lock,
+        ),
+
+        Inbound::BeginReshare {
+            ceremony_id,
+            me,
+            old_peers,
+            old_threshold,
+            new_peers,
+            new_threshold,
+            old_share_path,
+            public_key_hex,
+            new_share_path,
+        } => handle_reshare(
+            &role,
+            ceremony_id,
+            me,
+            old_peers,
+            old_threshold,
+            new_peers,
+            new_threshold,
+            old_share_path,
+            public_key_hex,
+            new_share_path,
+            &mut stdin_lock,
+            &mut stdout_lock,
+        ),
+
+        other => Err(anyhow!("first message must be a begin_* variant, got {other:?}")),
     };
 
     if let Err(e) = &result {
-        // Best-effort error report. ceremony_id may not be available
-        // on early failure; in that case the JSON lacks it and the bb
-        // wrapper logs the unmatched error.
         let err_msg = Outbound::CeremonyError {
             ceremony_id: String::new(),
             category: "internal".to_string(),
