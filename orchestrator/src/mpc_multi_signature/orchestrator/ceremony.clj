@@ -175,19 +175,21 @@
   "Drive a keygen ceremony; returns
      {:public-key <hex> :share-handle <uuid> :handles {role <uuid>} :ceremony/id <uuid>}
    on success."
-  [{:keys [participant-ids] :as orch} participants
+  [{:keys [participant-ids identity-pubkeys] :as orch} participants
    {:keys [threshold deadline-ms]
     :or   {threshold 2 deadline-ms 30000}}]
   (let [ceremony-id  (uuidv7/uuidv7)
         share-handle (uuidv7/uuidv7)
         peers        (vec participants)
         ids          (select-keys participant-ids peers)
+        peer-pubkeys (select-keys identity-pubkeys peers)
         make-begin   (fn [me]
                        {:msg/type              :ceremony/begin-keygen
                         :ceremony/id           ceremony-id
                         :ceremony/me           me
                         :ceremony/peers        peers
                         :ceremony/participant-ids ids
+                        :ceremony/peer-pubkeys peer-pubkeys
                         :ceremony/threshold    threshold
                         :ceremony/share-handle share-handle})
         finalize     (fn [results]
@@ -215,19 +217,21 @@
   "Drive a triple-generation ceremony. Each party produces shares of
    two Beaver triples (consumed together by one presign). Result:
      {:triple-handle <uuid> :handles {role uuid} :ceremony/id <uuid>}"
-  [{:keys [participant-ids] :as orch} participants
+  [{:keys [participant-ids identity-pubkeys] :as orch} participants
    {:keys [threshold deadline-ms]
     :or   {threshold 2 deadline-ms 60000}}]
   (let [ceremony-id   (uuidv7/uuidv7)
         triple-handle (uuidv7/uuidv7)
         peers         (vec participants)
         ids           (select-keys participant-ids peers)
+        peer-pubkeys  (select-keys identity-pubkeys peers)
         make-begin    (fn [me]
                         {:msg/type              :ceremony/begin-triples
                          :ceremony/id           ceremony-id
                          :ceremony/me           me
                          :ceremony/peers        peers
                          :ceremony/participant-ids ids
+                         :ceremony/peer-pubkeys peer-pubkeys
                          :ceremony/threshold    threshold
                          :ceremony/triple-handle triple-handle})
         finalize      (fn [_results]
@@ -243,7 +247,7 @@
   "Drive a presign ceremony, consuming a keygen share + a triple pair,
    producing a presignature stored per-party. Result:
      {:presig-handle <uuid> :handles {role uuid} :ceremony/id <uuid>}"
-  [{:keys [participant-ids] :as orch} participants
+  [{:keys [participant-ids identity-pubkeys] :as orch} participants
    {:keys [threshold share-handle triple-handle deadline-ms]
     :or   {threshold 2 deadline-ms 60000}}]
   (assert share-handle  "run-presign: :share-handle required")
@@ -252,12 +256,14 @@
         presig-handle (uuidv7/uuidv7)
         peers         (vec participants)
         ids           (select-keys participant-ids peers)
+        peer-pubkeys  (select-keys identity-pubkeys peers)
         make-begin    (fn [me]
                         {:msg/type              :ceremony/begin-presign
                          :ceremony/id           ceremony-id
                          :ceremony/me           me
                          :ceremony/peers        peers
                          :ceremony/participant-ids ids
+                         :ceremony/peer-pubkeys peer-pubkeys
                          :ceremony/threshold    threshold
                          :ceremony/share-handle share-handle
                          :ceremony/triple-handle triple-handle
@@ -295,27 +301,29 @@
    the coordinator party produces an ECDSA signature. Result:
      {:signature-hex <64-byte raw r||s in hex>
       :coordinator <role>  :ceremony/id <uuid>}"
-  [{:keys [participant-ids] :as orch} participants
+  [{:keys [participant-ids identity-pubkeys] :as orch} participants
    {:keys [threshold coordinator share-handle presig-handle digest-hex deadline-ms]
     :or   {threshold 2 deadline-ms 60000}}]
   (assert share-handle  "run-sign: :share-handle required")
   (assert presig-handle "run-sign: :presig-handle required")
   (assert digest-hex    "run-sign: :digest-hex required (32-byte hex)")
   (assert coordinator   "run-sign: :coordinator required (role keyword)")
-  (let [ceremony-id (uuidv7/uuidv7)
-        peers       (vec participants)
-        ids         (select-keys participant-ids peers)
-        make-begin  (fn [me]
-                      {:msg/type              :ceremony/begin-sign
-                       :ceremony/id           ceremony-id
-                       :ceremony/me           me
-                       :ceremony/peers        peers
-                       :ceremony/participant-ids ids
-                       :ceremony/threshold    threshold
-                       :ceremony/coordinator  coordinator
-                       :ceremony/share-handle share-handle
-                       :ceremony/presig-handle presig-handle
-                       :ceremony/digest-hex   digest-hex})
+  (let [ceremony-id  (uuidv7/uuidv7)
+        peers        (vec participants)
+        ids          (select-keys participant-ids peers)
+        peer-pubkeys (select-keys identity-pubkeys peers)
+        make-begin   (fn [me]
+                       {:msg/type              :ceremony/begin-sign
+                        :ceremony/id           ceremony-id
+                        :ceremony/me           me
+                        :ceremony/peers        peers
+                        :ceremony/participant-ids ids
+                        :ceremony/peer-pubkeys peer-pubkeys
+                        :ceremony/threshold    threshold
+                        :ceremony/coordinator  coordinator
+                        :ceremony/share-handle share-handle
+                        :ceremony/presig-handle presig-handle
+                        :ceremony/digest-hex   digest-hex})
         finalize    (fn [results]
                       (let [check (sign-consistency-check results coordinator)]
                         (if (:passed? check)
@@ -350,7 +358,7 @@
    parties in the union of old+new participate.
    Result: {:public-key <preserved hex> :share-handle <new uuid>
             :handles {role uuid} :ceremony/id <uuid>}"
-  [{:keys [participant-ids] :as orch}
+  [{:keys [participant-ids identity-pubkeys] :as orch}
    {:keys [old-participants new-participants old-threshold new-threshold
            old-share-handle public-key-hex deadline-ms]
     :or   {old-threshold 2 new-threshold 2 deadline-ms 60000}}]
@@ -366,8 +374,9 @@
         protocol-runners new-participants
         ;; Canonical ids for both old and new — needed by the protocol
         ;; algorithm even for old-only parties (referenced in metadata).
-        ids              (select-keys participant-ids
-                                      (distinct (concat old-participants new-participants)))
+        all-roles        (distinct (concat old-participants new-participants))
+        ids              (select-keys participant-ids all-roles)
+        peer-pubkeys     (select-keys identity-pubkeys protocol-runners)
         make-begin       (fn [me]
                            {:msg/type                 :ceremony/begin-reshare
                             :ceremony/id              ceremony-id
@@ -377,6 +386,7 @@
                             :ceremony/new-peers       (vec new-participants)
                             :ceremony/new-threshold   new-threshold
                             :ceremony/participant-ids ids
+                            :ceremony/peer-pubkeys    peer-pubkeys
                             :ceremony/old-share-handle (when (some #{me} old-participants)
                                                          old-share-handle)
                             :ceremony/new-share-handle new-share-handle
@@ -428,27 +438,29 @@
                      :identity-pubkey-hex ... ; binding mode only
                      :identity-signature-hex ...}} ; binding mode only
       :ceremony/id <uuid>}"
-  [{:keys [participant-ids] :as orch} participants
+  [{:keys [participant-ids identity-pubkeys] :as orch} participants
    {:keys [share-handle challenge-context-hex challenge-context-hex-by-role
            binding-mode? deadline-ms]
     :or   {deadline-ms 30000}}]
   (assert share-handle "run-share-possession-proof: :share-handle required")
   (assert (or challenge-context-hex challenge-context-hex-by-role)
           "run-share-possession-proof: :challenge-context-hex or :challenge-context-hex-by-role required")
-  (let [ceremony-id (uuidv7/uuidv7)
-        peers       (vec participants)
-        ids         (select-keys participant-ids peers)
-        ctx-for     (fn [me]
-                      (or (get challenge-context-hex-by-role me)
-                          challenge-context-hex))
-        make-begin  (fn [me]
-                      (cond-> {:msg/type                       :ceremony/begin-share-proof
-                               :ceremony/id                    ceremony-id
-                               :ceremony/me                    me
-                               :ceremony/participant-ids       ids
-                               :ceremony/share-handle          share-handle
-                               :ceremony/challenge-context-hex (ctx-for me)}
-                        binding-mode? (assoc :ceremony/binding-mode? true)))
+  (let [ceremony-id  (uuidv7/uuidv7)
+        peers        (vec participants)
+        ids          (select-keys participant-ids peers)
+        peer-pubkeys (select-keys identity-pubkeys peers)
+        ctx-for      (fn [me]
+                       (or (get challenge-context-hex-by-role me)
+                           challenge-context-hex))
+        make-begin   (fn [me]
+                       (cond-> {:msg/type                       :ceremony/begin-share-proof
+                                :ceremony/id                    ceremony-id
+                                :ceremony/me                    me
+                                :ceremony/participant-ids       ids
+                                :ceremony/peer-pubkeys          peer-pubkeys
+                                :ceremony/share-handle          share-handle
+                                :ceremony/challenge-context-hex (ctx-for me)}
+                         binding-mode? (assoc :ceremony/binding-mode? true)))
         finalize    (fn [results]
                       {:passed? true
                        :result  {:proofs      (into {}

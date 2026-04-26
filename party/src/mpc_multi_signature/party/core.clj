@@ -23,6 +23,7 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [signet.key :as signet-key]
+            [signet.session :as signet-session]
             [signet.sign :as signet-sign]
             [taoensso.timbre :as timbre]
             [taoensso.trove :as log]
@@ -70,12 +71,163 @@
       (aset out i (unchecked-byte (Integer/parseInt (subs s (* i 2) (+ (* i 2) 2)) 16))))
     out))
 
+(defn- bytes->base64 [^bytes bs]
+  (.encodeToString (java.util.Base64/getEncoder) bs))
+
+(defn- base64->bytes [^String s]
+  (.decode (java.util.Base64/getDecoder) s))
+
 (defn- make-identity-keypair
   "Generate a fresh Ed25519 identity keypair for this bb wrapper. A
    future revision may add an env-var override for repeatable test
    setups; today we keep things minimal."
   []
   (signet-key/signing-keypair))
+
+;; ---- per-ceremony Noise_KK pairwise sessions (Stage 5b.1) ----
+;;
+;; Forward-secret session layer between every pair of share-holders.
+;; Per ceremony, this party runs one Noise_KK_25519_ChaChaPoly_SHA256
+;; handshake with each peer (deterministic role: lower role-int
+;; initiates). Once all sessions are established, crypto-core's
+;; protocol_private and protocol_broadcast bodies are AEAD-wrapped
+;; outbound and unwrapped inbound; the orchestrator routes opaque
+;; ciphertext.
+
+(defn- build-sessions
+  "Build the initial pairwise handshake-state map: one entry per peer.
+
+   `me`             — this party's role keyword.
+   `peer-pubkeys`   — {role hex-pubkey} carried in the begin message;
+                      includes me as well, which we filter out.
+   `participant-ids`— {role int} canonical role↔id; used to pick
+                      initiator vs responder per pair (lower id wins).
+   `identity-kp`    — this party's long-term Ed25519 keypair.
+   `ceremony-id`    — uuid; bound into each session as the Noise
+                      prologue, so the same pair running two ceremonies
+                      derives different session keys.
+
+   Returns an atom keyed by peer-role, holding signet.session states."
+  [me peer-pubkeys participant-ids identity-kp ceremony-id]
+  (let [my-id    (get participant-ids me)
+        prologue (.getBytes (str ceremony-id) "UTF-8")]
+    (atom
+     (into {}
+           (for [[peer pubkey-hex] peer-pubkeys
+                 :when             (not= peer me)
+                 :let  [their-id   (get participant-ids peer)
+                        remote-pub (signet-key/->Ed25519PublicKey
+                                    :signet/ed25519-public-key
+                                    :Ed25519
+                                    (hex->bytes pubkey-hex))
+                        i-am-init? (< my-id their-id)
+                        builder    (if i-am-init?
+                                     signet-session/initiator
+                                     signet-session/responder)]]
+             [peer (builder identity-kp remote-pub {:prologue prologue})])))))
+
+(defn- session-write!
+  "Atomically apply Noise write-message to the session with `peer`,
+   returning the ciphertext bytes. Uses a volatile to extract the
+   produced ciphertext from inside swap! while keeping the session
+   update atomic. swap!'s retries are cheap and idempotent in
+   transport mode (same key, same nonce, same plaintext → same ct)."
+  [sessions peer ^bytes plaintext]
+  (let [ct-vol (volatile! nil)]
+    (swap! sessions update peer
+           (fn [s]
+             (let [[s' ct] (signet-session/write-message s plaintext)]
+               (vreset! ct-vol ct)
+               s')))
+    @ct-vol))
+
+(defn- session-read!
+  "Atomically apply Noise read-message to the session with `peer`,
+   returning the plaintext bytes. Same pattern as session-write!."
+  [sessions peer ^bytes ciphertext]
+  (let [pt-vol (volatile! nil)]
+    (swap! sessions update peer
+           (fn [s]
+             (let [[s' pt] (signet-session/read-message s ciphertext)]
+               (vreset! pt-vol pt)
+               s')))
+    @pt-vol))
+
+(defn- send-private!
+  "Helper: emit a :protocol/private EDN message to the orchestrator,
+   carrying base64-encoded ciphertext for `to` peer."
+  [out-writer me to ceremony-id ^bytes ct]
+  (locking out-writer
+    (.write ^java.io.Writer out-writer
+            (pr-str {:msg/type      :protocol/private
+                     :ceremony/id   ceremony-id
+                     :protocol/from me
+                     :protocol/to   to
+                     :protocol/body (bytes->base64 ct)}))
+    (.write ^java.io.Writer out-writer "\n")
+    (.flush ^java.io.Writer out-writer)))
+
+(defn- all-established?
+  [sessions]
+  (every? signet-session/established? (vals @sessions)))
+
+(defn- do-handshakes!
+  "Drive Noise_KK pairwise handshakes to completion before any
+   crypto-core protocol traffic flows. Procedure:
+
+   1. For each peer where I'm initiator, write Noise message 1
+      (empty payload) and dispatch as :protocol/private to the
+      orchestrator, which routes to that peer.
+   2. Loop on inbound messages from the orchestrator. Each
+      :protocol/deliver arriving during this phase is a Noise
+      handshake message from the named sender:
+        - If I'm responder for that peer: read msg 1, then write
+          msg 2 in reply.
+        - If I'm initiator: read msg 2, my session is now established.
+   3. Continue until every peer's session reports established?.
+
+   The same EDN message types (:protocol/private, :protocol/deliver)
+   carry both Noise handshake traffic and post-handshake encrypted
+   protocol traffic. The orchestrator does not distinguish: it just
+   routes."
+  [me sessions in-reader out-writer ceremony-id]
+  ;; Fire opening handshake messages.
+  (doseq [[peer s] @sessions
+          :when    (= :initiator (:role s))]
+    (let [ct (session-write! sessions peer (byte-array 0))]
+      (send-private! out-writer me peer ceremony-id ct)))
+  ;; Drive inbound until all sessions have completed Split().
+  (loop []
+    (when-not (all-established? sessions)
+      (let [msg (try (edn/read {:eof ::eof} in-reader)
+                     (catch Exception _e ::eof))]
+        (cond
+          (= ::eof msg)
+          (throw (ex-info "EOF during Noise handshake" {:phase :handshake}))
+
+          (= :ceremony/cancel (:msg/type msg))
+          (throw (ex-info "Cancel during Noise handshake" {:phase :handshake}))
+
+          (= :protocol/deliver (:msg/type msg))
+          (let [from (:protocol/from msg)
+                ct   (base64->bytes (:protocol/body msg))]
+            (session-read! sessions from ct)
+            ;; If this peer's session is responder-side and now has
+            ;; pos=1 (msg 1 read but not yet established), produce
+            ;; msg 2 in reply. The sole non-established post-read
+            ;; case is the responder having just consumed msg 1.
+            (when-not (signet-session/established? (get @sessions from))
+              (let [ct2 (session-write! sessions from (byte-array 0))]
+                (send-private! out-writer me from ceremony-id ct2))))
+
+          :else
+          (log/log! {:level :warn
+                     :id    :mpc-multi-signature.party.core/unexpected-during-handshake
+                     :data  {:msg-type (:msg/type msg)}}))
+        (recur))))
+  (log/log! {:level :info
+             :id    :mpc-multi-signature.party.core/noise-handshakes-established
+             :data  {:role me :peers (vec (keys @sessions))}}))
 
 ;; ---- per-party artifact paths ----
 
@@ -226,35 +378,6 @@
         (for [[k v] m]
           [(keyword "result" (str/replace (name k) "_" "-")) v])))
 
-(defn- json->edn-out
-  [i->r ceremony-id-uuid m]
-  (case (get m "msg_type")
-    "protocol_broadcast"
-    {:msg/type      :protocol/broadcast
-     :ceremony/id   ceremony-id-uuid
-     :protocol/from (get i->r (get m "from"))
-     :protocol/body (get m "body")}
-
-    "protocol_private"
-    {:msg/type      :protocol/private
-     :ceremony/id   ceremony-id-uuid
-     :protocol/from (get i->r (get m "from"))
-     :protocol/to   (get i->r (get m "to"))
-     :protocol/body (get m "body")}
-
-    "ceremony_complete"
-    {:msg/type        :ceremony/complete
-     :ceremony/id     ceremony-id-uuid
-     :ceremony/result (json-result->edn-result (get m "result"))}
-
-    "ceremony_error"
-    {:msg/type       :ceremony/error
-     :ceremony/id    ceremony-id-uuid
-     :ceremony/error {:category (get m "category")
-                      :message  (get m "message")}}
-
-    nil))
-
 ;; ---- I/O glue ----
 
 (defn- send-edn! [out form]
@@ -285,25 +408,76 @@
                   :result/identity-signature-hex (bytes->hex sig-bytes)))))
 
 (defn- spawn-rust-reader-thread!
+  "Translates messages from crypto-core's stdout (JSON Lines) to the
+   orchestrator (EDN). Stage 5b.1: protocol_private and
+   protocol_broadcast bodies are AEAD-wrapped via the per-peer
+   Noise_KK session before being forwarded; broadcast is fanned out
+   to one private message per peer (one ciphertext per recipient,
+   each authenticated to that pair)."
   [role i->r ceremony-id-uuid rust-stdout out done?
-   {:keys [binding-mode? identity-kp]}]
-  (let [reader (BufferedReader. (java.io.InputStreamReader. rust-stdout))]
+   {:keys [binding-mode? identity-kp sessions]}]
+  (let [reader (BufferedReader. (java.io.InputStreamReader. rust-stdout))
+        ;; Snapshot peers at thread start; the session keyset is
+        ;; fixed for the ceremony's lifetime.
+        peers  (vec (keys @sessions))]
     (doto (Thread. ^Runnable
            (fn []
              (try
                (loop []
                  (let [line (.readLine reader)]
                    (when line
-                     (let [m   (json/parse-string line)
-                           edn (json->edn-out i->r ceremony-id-uuid m)
-                           edn (if (and binding-mode?
-                                        (= :ceremony/complete (:msg/type edn)))
-                                 (augment-with-binding-signature edn identity-kp)
-                                 edn)]
-                       (when edn
-                         (send-edn! out edn))
-                       (when (#{"ceremony_complete" "ceremony_error"} (get m "msg_type"))
-                         (reset! done? true))
+                     (let [m        (json/parse-string line)
+                           msg-type (get m "msg_type")]
+                       (case msg-type
+                         "protocol_private"
+                         (let [from-role (get i->r (get m "from"))
+                               to-role   (get i->r (get m "to"))
+                               pt        (base64->bytes (get m "body"))
+                               ct        (session-write! sessions to-role pt)]
+                           (send-edn! out
+                                      {:msg/type      :protocol/private
+                                       :ceremony/id   ceremony-id-uuid
+                                       :protocol/from from-role
+                                       :protocol/to   to-role
+                                       :protocol/body (bytes->base64 ct)}))
+
+                         "protocol_broadcast"
+                         ;; Fan out: one encrypted private per peer.
+                         ;; Each ciphertext is bound (via the Noise
+                         ;; session's AEAD tag) to a specific recipient.
+                         (let [from-role (get i->r (get m "from"))
+                               pt        (base64->bytes (get m "body"))]
+                           (doseq [peer peers]
+                             (let [ct (session-write! sessions peer pt)]
+                               (send-edn! out
+                                          {:msg/type      :protocol/private
+                                           :ceremony/id   ceremony-id-uuid
+                                           :protocol/from from-role
+                                           :protocol/to   peer
+                                           :protocol/body (bytes->base64 ct)}))))
+
+                         "ceremony_complete"
+                         (let [edn  {:msg/type        :ceremony/complete
+                                     :ceremony/id     ceremony-id-uuid
+                                     :ceremony/result (json-result->edn-result (get m "result"))}
+                               edn  (if binding-mode?
+                                      (augment-with-binding-signature edn identity-kp)
+                                      edn)]
+                           (send-edn! out edn)
+                           (reset! done? true))
+
+                         "ceremony_error"
+                         (do (send-edn! out
+                                        {:msg/type       :ceremony/error
+                                         :ceremony/id    ceremony-id-uuid
+                                         :ceremony/error {:category (get m "category")
+                                                          :message  (get m "message")}})
+                             (reset! done? true))
+
+                         ;; Unknown msg type from crypto-core
+                         (log/log! {:level :warn
+                                    :id    :mpc-multi-signature.party.core/unknown-rust-msg-type
+                                    :data  {:role role :msg-type msg-type}}))
                        (recur)))))
                (catch Exception e
                  (log/log! {:level :error
@@ -325,13 +499,33 @@
      nil          — orchestrator EOF or cancel;
      <begin-msg>  — orchestrator sent a begin-* message after this
                     ceremony finished (its Rust subprocess exited);
-                    -main hands it to a fresh run-ceremony! invocation."
+                    -main hands it to a fresh run-ceremony! invocation.
+
+   Stage 5b.1 lifecycle:
+   1. Build pairwise Noise_KK sessions from :ceremony/peer-pubkeys.
+   2. Drive Noise handshakes via :protocol/private routing — these
+      messages travel through the orchestrator like any other peer
+      traffic; the orchestrator does not distinguish handshake from
+      protocol bytes.
+   3. Once all sessions are established, spawn crypto-core and start
+      the protocol. Outbound protocol bodies are AEAD-wrapped under
+      the recipient's session in the rust-reader thread; inbound
+      :protocol/deliver bodies are unwrapped here before forwarding
+      to crypto-core."
   [role identity-kp begin-msg in-reader out-writer]
   (let [r->i           (ceremony-participant-ids begin-msg)
         i->r           (into {} (map (fn [[k v]] [v k])) r->i)
         ceremony-id    (:ceremony/id begin-msg)
+        peer-pubkeys   (:ceremony/peer-pubkeys begin-msg)
         binding-mode?  (and (= :ceremony/begin-share-proof (:msg/type begin-msg))
                             (boolean (:ceremony/binding-mode? begin-msg)))
+        sessions       (build-sessions role peer-pubkeys r->i identity-kp ceremony-id)
+        ;; Drive Noise handshakes before spawning crypto-core. This
+        ;; reads :protocol/deliver messages from the orchestrator
+        ;; and dispatches Noise handshake replies via
+        ;; :protocol/private; once every peer's session is
+        ;; established, the function returns.
+        _              (do-handshakes! role sessions in-reader out-writer ceremony-id)
         rust-process   (spawn-crypto-core! role)
         rust-stdin     (BufferedWriter. (java.io.OutputStreamWriter.
                                          (.getOutputStream rust-process)))
@@ -345,7 +539,9 @@
                                             :exit-code (.exitValue rust-process)}}))]
     (spawn-rust-reader-thread! role i->r ceremony-id
                                (.getInputStream rust-process) out-writer done?
-                               {:binding-mode? binding-mode? :identity-kp identity-kp})
+                               {:binding-mode? binding-mode?
+                                :identity-kp   identity-kp
+                                :sessions      sessions})
     (send-json! rust-stdin (begin->json begin-msg))
     (loop []
       (let [msg (try (edn/read {:eof ::eof} in-reader)
@@ -366,9 +562,14 @@
                            :data  {:role role
                                    :ceremony-id (:ceremony/id msg)
                                    :from (:protocol/from msg)}})
-                (try (send-json! rust-stdin (deliver->json r->i msg))
-                     (catch java.io.IOException _e
-                       (reset! done? true))))
+                (try
+                  (let [from (:protocol/from msg)
+                        ct   (base64->bytes (:protocol/body msg))
+                        pt   (session-read! sessions from ct)
+                        plain-msg (assoc msg :protocol/body (bytes->base64 pt))]
+                    (send-json! rust-stdin (deliver->json r->i plain-msg)))
+                  (catch java.io.IOException _e
+                    (reset! done? true))))
               (recur))
 
           (= :ceremony/cancel (:msg/type msg))
