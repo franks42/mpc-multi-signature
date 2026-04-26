@@ -47,16 +47,25 @@ triple-generation, presign).
 
 **`docs/recovery-exploration-harness-design.md`** — architectural
 rationale for everything: layer responsibilities, role asymmetry,
-implementation plan in stages, EDN vocabulary appendix.
+implementation plan in stages, EDN vocabulary appendix. Appendix E
+and Appendix F (added 2026-04-26) capture Stage 5+ design decisions
+for confidentiality/transport and share-possession proofs.
 
 **`docs/mpc-feasibility-spike.md`** — proves cryptographic
 feasibility against NEAR's `threshold-signatures` crate with two
 working tests. The Rust core's API is exercised here; consult before
-writing your own Rust wrapper.
+writing your own Rust wrapper. (As of Stage 4 we are pinned to
+`near/mpc` rev `a6e41e8`.)
 
 **`docs/ylds-asset-recovery-use-cases.md`** and
 **`docs/mpc-kyc-key-recovery.md`** — earlier domain memos. Background
 for the problem, not implementation guidance. Skim once for context.
+
+**Project memory** — durable cross-session state. Two key entries
+to load via the MCP memory tool at session start:
+search-tag `mpc-multi-signature,plan` for the live plan/status
+(Stage 4 done, Stage 5 entry points), and `signet,encryption,
+planned-enhancement` for the signet 0.5.0 work that lives upstream.
 
 ## Things the docs assume you understand
 
@@ -83,6 +92,17 @@ dictionary's `:crypto/wallet-public-key` is the persistent identity
 of a wallet; shares are subordinate to it. This is the load-bearing
 UC2 invariant.
 
+**Canonical participant-ids** (Stage 4 lesson). The threshold-
+signatures crate's `KeygenOutput` has the integer participant-id
+baked into the share. If the role↔int mapping drifts between
+ceremonies — e.g. recomputed per-ceremony from `:ceremony/peers`
+ordering — a post-reshare share will fail the next presign with
+"received incorrect shares of additive triple phase". The
+orchestrator owns ONE canonical mapping (registered at
+`start-orchestrator` time, each role's index in `:roles` is its
+stable id) and propagates it in every begin-* message. Stage 5+
+work that introduces new ceremonies must follow the same convention.
+
 **The orchestrator is harness-only.** It has no production analog.
 In production, a transient "ceremony coordinator" role rotates among
 the parties per ceremony. The EDN message vocabulary and statecharts
@@ -99,38 +119,75 @@ independently.
 ## Implementation plan — staged
 
 The plan is in `docs/recovery-exploration-harness-design.md` under
-"Implementation plan". Stages 0 and 0.5 are done (the dictionary and
-three statecharts). Your starting point is Stage 1.
+"Implementation plan". **Stages 0 through 4 are done as of
+2026-04-26**; Stage 5 is next.
 
-A short summary of the staging:
+Status at a glance:
 
 - **Stage 0 (done)** — data dictionary + EDN message vocabulary.
-- **Stage 0.5 (in progress)** — orchestrator-side statechart per
-  ceremony. Three of eight ceremony charts complete; five remain.
-- **Stage 1** — null orchestrator and null parties. Three Clojure
-  processes (or three core.async go-blocks in one JVM) exchanging
-  EDN messages, with stubbed ceremonies that just round-trip without
-  doing real cryptography. Validates routing and message shapes at
-  zero cryptographic cost.
-- **Stage 2** — replace one party's stub with a real bb-wrapper
-  plus Rust binary that performs actual keygen. Other two parties
-  stay stubbed. Validates the bb-to-Rust stdio path and the JSON
-  translation.
-- **Stage 3** — replace the other two parties. End-to-end real
-  keygen.
-- **Stage 4** — add reshare and sign ceremonies. The high-water
-  mark is the executable analog of the UC2 feasibility test:
-  end-to-end keygen + reshare-with-member-change + sign across
-  separated processes, with public-key preservation verified.
-- **Stage 5** — layer business logic: commitment registries,
-  attestation services, recovery policy. This is where party-bbs
-  start substantively diverging.
+- **Stage 0.5 (partial)** — three of eight ceremony charts written
+  (`statechart-keygen.edn`, `statechart-sign.edn`,
+  `statechart-reshare-recovery.edn`). Remaining: divorce, refresh,
+  attestation-issuance, triple-generation, presign,
+  share-possession-proof. Stage 5 work likely needs charts for some
+  of these.
+- **Stage 1 (done)** — null orchestrator + three null parties round-
+  tripping a stubbed `:keygen` ceremony in EDN. Tag
+  `v0.1.0-stage-1-null-orchestrator`.
+- **Stage 2 (done)** — bb wrapper + Rust crypto-core plumbing
+  validated for one party with two stubs. Tag
+  `v0.2.0-stage-2-bb-rust-plumbing`.
+- **Stage 3 (done)** — all three parties bb+rust; first end-to-end
+  real keygen with persisted shares (rmp-serde + SHA-256
+  fingerprint). Tag `v0.3.0-stage-3-real-keygen`.
+- **Stage 4 (done)** — UC2 high-water mark: keygen → reshare-with-
+  member-change → sign with new shareset → independent cross-verify
+  via signet/BC against the original public key. Tag
+  `v0.4.0-stage-4-uc2-complete`.
+- **Stage 5 (next)** — production-readiness primitives + business
+  logic. See `docs/recovery-exploration-harness-design.md`
+  Appendix E (confidentiality/transport) and Appendix F
+  (share-possession + identity-share binding proofs) for the
+  architectural decisions captured during Stage 4. The traditional
+  Stage 5 scope (commitment registries, attestation services,
+  recovery policy gates) sits on top.
 
-Don't skip Stage 1. The temptation will be to jump to Stage 2 because
-real crypto is more interesting than stubs. Stage 1 finds half the
-ambiguities in the EDN vocabulary at zero cryptographic cost; those
-same ambiguities found at Stage 4 cost a day of debugging instead of
-half an hour of redesign.
+Architecture invariants locked in Stages 1–4 (carry forward):
+
+1. `party/` and `crypto-core/` are SINGLE codebases used by all roles
+   — only the `--role` flag differs. Don't fork them per party.
+2. **Canonical role↔int participant-id mapping** is registered at
+   `start-orchestrator` time (each role's index in `:roles` is its
+   stable id). Threshold-signatures shares are bound to specific
+   integer ids; if those drift between ceremonies, presign rejects
+   with "received incorrect shares of additive triple phase".
+3. Triple-generation, presign, sign, reshare are SEPARATE ceremonies
+   with persisted intermediates between phases (per the dictionary's
+   `:ceremony/*` decomposition). Sets up Stage 5+ triple-stockpiling
+   for free.
+4. Reshare protocol-runner rule: only `new_participants` run the
+   reshare Protocol (per cait-sith). Old-only participants are
+   referenced via `old_participants` metadata in the begin message
+   but don't exchange protocol messages.
+5. The orchestrator has no production analog. In production, a
+   transient ceremony-coordinator role rotates among the parties per
+   ceremony. EDN vocabulary + statecharts span both contexts
+   unchanged (same contract, different process).
+
+Spec issues found and worked around (still pending fix in the spec
+files themselves):
+
+1. `specs/statechart-keygen.edn` lines 95–106 + `statechart-sign.edn`
+   lines 120–129: duplicate `:event/ceremony-complete` keys in
+   `:state/running`'s `:on` map — invalid EDN. Implementation uses
+   guarded transitions properly; spec needs the same fix.
+2. Both charts use `{:like :region/holder :substitute-actor X}`
+   shorthand — not real `clj-statecharts` syntax; needs preprocessor
+   or explicit per-region expansion.
+3. Design doc Appendix A uses `:ceremony/error/category` and
+   `:ceremony/error/message` — multi-slash keywords are invalid EDN.
+   Implementation uses nested-map `:ceremony/error {:category ...
+   :message ...}`; appendix needs the same.
 
 ## Implementation hints
 
@@ -313,38 +370,56 @@ sessions that produced this design were valuable specifically
 because they distinguished "verified" from "expected" from
 "assumed." Carry that forward.
 
-## Stage 1 starter task
+## Stage 5 entry points
 
-If you've read this far and want a concrete first task: implement
-the Stage 1 null orchestrator and three null party stubs that can
-exchange EDN messages for a stubbed `:keygen` ceremony. Acceptance
-criteria:
+Stages 0–4 are done. The harness now runs the UC2 high-water-mark
+end-to-end (keygen → reshare with member change → sign with new
+shareset → independent cross-verify via signet/BC against the
+original public key, ~3.3 s wall time). What's next:
 
-1. Orchestrator binary starts (`clojure -M:run` or equivalent) and
-   spawns three party subprocesses.
-2. From the REPL: `(keygen orch [:holder :figure :ic] {:threshold 2})`
-   sends a `:ceremony/begin-keygen` message to each party.
-3. Each party stub responds with a `:ceremony/complete` message
-   carrying a placeholder result (e.g., a fake handle UUID and a
-   fake public-key string).
-4. Orchestrator collects results, runs the keygen consistency
-   check from `statechart-keygen.edn` (which will pass trivially
-   because all parties returned the same fake public key), and
-   transitions to `:state/complete`.
-5. The REPL call returns a map with the placeholder handles and
-   public key. The whole flow takes well under one second.
+**Stage 5a — share-possession + identity-share binding proofs**
+(per design doc Appendix F). Small primitive (~80 LOC across
+crypto-core + orchestrator), large architectural payoff. Should land
+before any business-logic work because the binding proof is the
+foundational ceremony-handshake authenticator. Depends on the
+threshold-signatures crate's per-party `VerifyingShare` being
+propagated through `crypto-core`'s keygen result up to the
+orchestrator's `:state/address-policy-registry` entry.
 
-No real cryptography. No Rust subprocess yet. No JSON. Just EDN
-messages between Clojure processes (or between go-blocks; one JVM
-is fine for Stage 1). The point is to validate that the message
-shapes round-trip cleanly and the statechart transitions execute
-correctly when driven by realistic event sequences. Surprises here
-are cheap to fix; surprises at Stage 4 are not.
+**signet 0.5.0 — encryption layer** (in the sibling project
+`../signet`, recorded in memory tagged `signet,encryption,planned-
+enhancement`). signet currently has X25519 keys + raw Diffie–Hellman
+but no symmetric encryption primitive. Add `signet.encryption/box`
++ `unbox` (sender-authenticated AEAD) using ChaCha20-Poly1305 via
+JCA. Bb-compatible (no BouncyCastle needed for symmetric crypto).
+~150–200 LOC. The user's standing preference is "enhance signet
+before mpc-multi-signature needs it" — same pattern that shipped
+secp256k1 in signet 0.4.0 before Stage 4 needed it.
 
-When that works, the next task is Stage 2: replace the holder stub
-with a real bb wrapper plus Rust subprocess that does actual keygen
-participation. The other two parties remain stubbed. This validates
-the bb-to-Rust stdio path independently of the multi-party
-coordination.
+**Stage 5b — transport hardening** (per design doc Appendix E).
+Noise XK-pattern session layer in the bb wrapper, AEAD-wrapping
+`protocol_broadcast`/`protocol_private` bodies. Builds on signet
+0.5.0. Plus encryption-at-rest for `<role>/{shares,triples,presigs}`
+files (HSM/keyring/TEE backend behind the same handle-based API).
+
+**Stage 5c — business logic.** The traditional Stage 5 scope:
+commitment registries (Figure-side), commitment-gated reshare,
+publication/objection windows, multi-party authorization gates for
+recovery (Figure + IC verify attestations independently),
+attestation-issuance ceremonies (KYC TAS, commitment TAS, social
+recovery TAS). Per the design doc: "the architecture's payoff
+arrives — adding policy is bb-side logic, not orchestrator/crypto-
+core changes."
+
+**Working entry pattern for a fresh session:**
+
+1. Read this file (orientation).
+2. `mcp__memory__memory_search` for tag `mpc-multi-signature,plan`
+   to load the latest plan/status memory; for tag
+   `signet,planned-enhancement` to load the signet roadmap.
+3. Skim `docs/recovery-exploration-harness-design.md` Appendix E + F
+   for the Stage 5+ architecture decisions.
+4. `git log --oneline -20` for the recent narrative.
+5. Pick a substage (5a / signet 0.5.0 / 5b / 5c) and start.
 
 Good luck. Ask early, test often.
