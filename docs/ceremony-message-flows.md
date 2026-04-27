@@ -1,9 +1,11 @@
 # Ceremony Message Flows — A Reading Guide
 
-This document walks through two ceremonies — the **bootstrap (keygen)**
-ceremony that creates a fresh wallet, and a **routine signing**
-ceremony — at the message level, in the form of sequence diagrams.
-The goal is to make the temporal flow and multi-party choreography
+This document walks through three ceremonies at the message level
+in the form of sequence diagrams: the **bootstrap (keygen)**
+ceremony that creates a fresh wallet, a **routine signing**
+ceremony, and the **recovery reshare (UC2)** ceremony that replaces
+a lost-share holder while preserving the wallet's public key. The
+goal is to make the temporal flow and multi-party choreography
 legible without the cryptographic mechanics underneath.
 
 The diagrams ignore transport — by the time you read a message in
@@ -402,6 +404,260 @@ presignature file on consumption.
 
 ---
 
+## Ceremony 3 — Recovery Reshare (UC2)
+
+**Goal**: the original holder has lost their share. A fresh
+new_holder identity replaces them, but **the wallet's public key
+is preserved** — same on-chain identity, fresh shareset. End
+state: new_holder, F, and IC each hold a new share of the *same*
+wallet public key; the original holder's share record is retired
+in the bookkeeping registry. (See the "Common misconception"
+note at the end — the *cryptographic* old shares aren't erased
+by the reshare; only the policy-layer record of them is retired.)
+
+This is the most interesting structural ceremony in the system.
+It differs from keygen in three structural ways:
+
+1. **It's a change of membership, not a fresh start.** F and IC's
+   *existing* shares are inputs (the lost holder's share is gone,
+   but it was below threshold so the wallet survives). The new
+   shareset is the output.
+2. **A multi-party authorization gate runs before any cryptography.**
+   F and IC each *independently* verify attestations and recovery
+   intent. Neither delegates to the other.
+3. **An optional objection window** may be required by the address
+   policy for high-value wallets.
+4. **A continuity check at the end** confirms the produced public
+   key equals the original — the load-bearing UC2 invariant.
+
+(The bootstrap preamble has just completed. The `begin-reshare`
+instruction carries `old-peers = [orig_holder, F, IC]`,
+`new-peers = [new_holder, F, IC]`, the original `wallet-public-key`
+as the continuity anchor, and the recovery credentials —
+`identity-attestation` and `recovery-intent` — that the
+authorization gate will check. Pairwise `TK_{X,Y}`s are in place
+between every *new* participant. The lost holder is referenced
+in metadata only and exchanges no messages.)
+
+### Phase 1 — Authorization gate (independent multi-party)
+
+```
+   F                                       IC
+   │ verify attestation signature          │ verify attestation signature
+   │ verify recovery-intent signature      │ verify recovery-intent signature
+   │ verify both within freshness window   │ verify both within freshness window
+   │ verify policy match for this wallet   │ verify policy match for this wallet
+   │                                       │
+   │ ── gate-pass / gate-fail ─►           │ ── gate-pass / gate-fail ─►
+   │                            coordinator                          coordinator
+```
+▷ F and IC each run the **same set of checks independently**: each
+   has its own copy of the address policy, queries its own
+   attestation source, and verifies signatures against its own copy
+   of the TAS public keys. The independence is the load-bearing
+   trust property — F cannot vouch for IC's verification, nor IC
+   for F's. The ceremony advances **only if both gates pass**; if
+   either rejects, the ceremony aborts. The 🔓 status of the
+   credentials matters: attestations and recovery-intent are
+   *meant* to be visible (they're authorization credentials, not
+   secrets), and their signatures are what give them weight.
+
+### Phase 2 — Objection window (optional, address-policy-driven)
+
+```
+   coordinator → audit-log    : "recovery pending for <wallet-pk>"   🔓
+   coordinator → IC-mirror    : "recovery pending for <wallet-pk>"   🔓
+   coordinator starts objection-window timer (e.g., 24 hours)
+
+   if   timer elapses with no objection   →  proceed to Phase 3
+   elif objection raised via separate channel → abort
+```
+▷ For wallets whose address policy demands it (typically
+   high-value), the in-flight recovery is published to a publicly-
+   readable log and an IC-side mirror. Anyone monitoring those
+   logs — including a lost-but-still-watching original holder —
+   can raise an objection through an out-of-band channel within
+   the configured window. If the window elapses cleanly, the
+   ceremony proceeds; an objection aborts it. This is a
+   "publish-then-execute" defense layered on top of the
+   cryptographic gate.
+
+### Phase 3 — Reshare protocol (new participants only)
+
+```
+   new_holder           F              IC
+   │ ◄── proto ──── │  ─── proto ──── │
+   │ ◄── proto ──── │ ◄── proto ──── │      multi-round reshare
+   │ ─── proto ──── │ ◄── proto ──── │      (cait-sith-style;
+   │ ─── proto ──── │ ─── proto ──── │       same VSS shape as
+   │                │                │       keygen, with the
+                                              old shares as inputs)
+```
+▷ **Only the new participants run the cryptographic protocol.**
+   The lost holder's share (if any) is referenced via the
+   `old_participants` metadata in the begin message — the protocol
+   needs the original participant indices for its math — but the
+   lost holder exchanges no messages. The cait-sith reshare
+   tolerates absent old participants as long as the *surviving*
+   ones meet the original threshold; with old-threshold = 2 and
+   F + IC online, that's met.
+
+   Conceptually each surviving old participant `P` (= F or IC)
+   takes its existing share `x_P^old` and runs a VSS-shaped
+   sub-protocol where `x_P^old` is treated like a contribution
+   to a polynomial: P picks fresh polynomial coefficients, builds
+   `commit_P^new`, evaluates it at each new participant's index
+   to make `s_{P→Q}^new`, and broadcasts/sends the pieces as in
+   keygen. Each new participant `Q` then computes its share by
+   summing the incoming subshares **weighted by Lagrange
+   coefficients** — those weights are precisely what makes the
+   wallet's *original* private key reconstruct (implicitly,
+   never materialized) into the *new* shareset. The wallet's
+   private key is never assembled at any point in this ceremony,
+   any more than it was in keygen.
+
+   **Sensitivity profile.** Same as keygen: commitments are
+   public-by-design (🔒 defense-in-depth on the wire), subshares
+   are load-bearing private (🔒 must never escape {sender,
+   recipient}). The old shares `x_F^old`, `x_IC^old` are 🗝 —
+   they enter the protocol as locally-decrypted plaintext and
+   never leave their parties.
+
+### Phase 4 — Continuity check + report up + retire old record
+
+```
+   each new participant Q → coordinator : ceremony/complete           🔓
+                              { wallet-public-key, X_Q^new = x_Q^new·G }
+
+   coordinator checks:
+     ALL three reported wallet-public-key values
+     == the original wallet-public-key from the begin message.
+
+   on success:
+     - new shares persisted locally (encrypted at rest)
+     - F's audit-log + IC's mirror record:
+         "old holder share-record for <wallet-pk> retired"
+       (a policy-layer entry — does NOT cryptographically erase
+        the underlying share material; see misconception note)
+```
+▷ The continuity check is the **load-bearing UC2 invariant**:
+   the new shareset must produce the same public key as the
+   original. Any disagreement means the new shareset is unusable
+   for the existing wallet identity (the on-chain address, all
+   prior signatures, the attestation policy registered against
+   the original public key — all bound to the same key bytes).
+   Disagreement aborts the ceremony. On success, the lost
+   holder's share *record* is retired in F's audit-log and IC's
+   mirror so that the orchestrator (or any well-behaved
+   coordinator) refuses to reference that handle in future
+   ceremonies. This is a **policy-layer retirement**, not a
+   cryptographic erasure — the old polynomial and the surviving
+   parties' old share files remain mathematically valid; see
+   the misconception note below.
+
+### Why this works without the lost share
+
+Threshold cryptography's whole point: with threshold-of-N
+cryptography (here 2-of-3), losing 1 share leaves you exactly
+at threshold. F + IC alone, with their two shares, can do
+*anything* the wallet needs — including reconstruct it implicitly
+via Lagrange interpolation as part of a reshare. The lost
+holder's share isn't recoverable, but it isn't *needed* — it was
+one of N shares, and we still have threshold of them.
+
+If F and IC had *both* been compromised at the same time, no
+recovery would be possible (and one of them being compromised
+without the other would already be a successful attack on the
+2-of-3 wallet — different threat model). The IC's offline-by-
+default posture exists precisely so that "F compromised AND IC
+compromised at the same time" is a tiny attack surface.
+
+### Common misconception: "old shares are now invalidated"
+
+A reasonable first reading of "recovery produces a new shareset
+under the same public key" is that the **old shareset has been
+invalidated** by the reshare — that F's and IC's pre-recovery
+shares are now somehow inert. **That reading is wrong**, and the
+distinction matters.
+
+What's actually true:
+
+- A reshare produces a **fresh polynomial**. Every new share is
+  an evaluation of this new polynomial; the new shareset is
+  internally consistent and can sign for the wallet.
+- The **old polynomial is still mathematically valid**. F's and
+  IC's pre-recovery share files, if kept, are still legitimate
+  evaluations of `f_old`, and the pair `{f_old(F_idx),
+  f_old(IC_idx)}` still reconstructs the same wallet private
+  key as before. The protocol cannot reach into a party's
+  storage and erase what's on disk.
+- New shares **cannot be mixed with old shares** to sign — they
+  belong to different polynomials. But you don't need to mix:
+  the old shareset alone is still a fully-functional 2-of-3
+  among `{lost_holder, F, IC}`, so any two parties holding old
+  shares can still sign. After recovery, that means F + IC
+  alone can still sign using their old shares, in parallel with
+  the new shareset's ability to sign.
+
+So a precise statement of what recovery does and doesn't buy:
+
+- ✅ **Replaces the lost holder's identity.** new_holder has
+  signing capability under the same public key.
+- ✅ **Bookkeeping invalidation of the lost holder's share
+  record.** F's audit log + IC's mirror mark the original
+  handle as no-longer-valid; future ceremonies refuse to
+  accept it as input. **This is policy-level, not
+  cryptographic** — the share material itself isn't gone;
+  the orchestrator just refuses to reference it.
+- ⚠️ **Rotation of share material against future compromise —
+  only if F and IC delete their old share files.** The protocol
+  cannot enforce that; it's an operational hygiene step paired
+  with the cryptographic reshare. If they don't delete, the
+  rotation benefit doesn't materialize, and any pre-existing
+  copy outside their storage doesn't go away either.
+
+Calling the old shares "obsolete" or "invalidated by the reshare"
+overstates what happened. A safer wording: the old shares are
+**superseded** in the wallet's official current configuration but
+remain **mathematically functional until honestly deleted**. The
+reshare's rotation benefit is contingent on that deletion; without
+it, the wallet just has *two* working sharesets in circulation.
+
+### What honest deletion buys you
+
+If F and IC genuinely delete their old share files, something
+nice happens for the *original* holder's share too: anyone who
+later finds, steals, or recovers a copy of the lost holder's
+old share file **cannot use it to sign anything**. They would
+need a second share from the same old polynomial to reach the
+2-of-3 threshold, and F's and IC's old share material no longer
+exists anywhere in the world. The old polynomial would have at
+most *one* surviving evaluation — below threshold, useless.
+
+In that strong sense, **F and IC's deletion is what makes a
+leaked old holder share retroactively obsolete**. The reshare
+ceremony alone does not — it just produces a new shareset
+alongside the old one. The "obsoleting" of the old shareset is
+a downstream consequence of the operational deletion step, not
+of the cryptographic protocol. This is the actual security
+benefit people *imagine* the reshare provides; it's available
+only when the surviving members do their part.
+
+This isn't a *new* threat introduced by recovery — F and IC are
+already 2-of-3 parties in a 2-of-3 wallet, so they can already
+collude to sign at any time, before or after recovery. What
+recovery *adds* to this picture is that an external party (an
+attacker who copied F's or IC's old share off-disk before
+recovery) now also has a working signing partner-piece, and the
+recovery itself doesn't take that away. The "rotate the
+polynomial periodically" practice (`reshare-refresh`) exists for
+the same reason key rotation exists in any system — to bound the
+temporal window during which any one historical share's
+compromise matters — but only if rotation is paired with actual
+deletion of the previous share material.
+
+---
+
 ## What the coordinator role never sees
 
 Whether the coordinator role is held by the orchestrator (this
@@ -428,8 +684,13 @@ party compromise.
 - **Triple-generation and presign ceremonies** that prepare the
   signing stockpile. Structurally identical to keygen at this
   level of abstraction.
-- **Reshare and recovery ceremonies (UC2).** Most interesting
-  structural ceremonies in the system; deserve their own walkthrough.
+- **The other reshare ceremonies** — `reshare-divorce` (holder
+  voluntarily removes Figure) and `reshare-refresh` (periodic share
+  hygiene; same shareset, fresh shares). Both share UC2's structural
+  shape and authorization-gate flavor, with different coordinator
+  roles (IC drives divorce since Figure is being removed; refresh
+  has the lightest authorization bar since membership doesn't
+  change).
 - **Crypto-core internals** — share encoding, polynomial math,
   proof construction, MTA / OT subprotocols inside the threshold-
   signatures crate. By design, none of that surfaces here.
