@@ -331,6 +331,36 @@ explicit attestation policies, structural ceremonies, and the
 IC's load-bearing independence) has requirements that go beyond
 a generic enterprise custody product.
 
+### Vendor independence: a consequence of Principle #1 when MPC is outsourced
+
+Outsourcing MPC infrastructure to a specialist vendor (Cordial,
+or any successor) lines up well with the principle of giving
+security-sensitive technical functionality to a company whose
+core business depends on getting it right — focused review,
+amortized bug-finding cost, established audit posture. The
+trade-off it introduces is that **the vendor enters the trust
+boundary**.
+
+For the IC, this matters concretely. Foundational Principle #1
+requires the IC to be independent of Figure across organizational,
+operational, legal, and technical dimensions. If a single MPC
+vendor runs both Figure's nodes *and* the IC's nodes, then:
+
+- ✅ Organizational, operational, legal independence between the
+  IC operator and Figure operator can still be intact.
+- ⚠️ **Technical independence is not.** A vendor bug, a vendor
+  outage, or a vendor subpoena hits both Figure's and the IC's
+  MPC infrastructure simultaneously.
+
+The mitigation is to require, as part of the IC vetting that
+satisfies Principle #1, that the IC's MPC stack run on a
+*different* vendor (or on infrastructure independent of any vendor
+shared with Figure) — turning vendor diversity into part of the
+independence requirement. This is a deployment-time constraint,
+not a harness-design constraint, but it should be explicit in the
+trust analysis when the harness ships against real vendor
+infrastructure.
+
 ## Trust matrix (summary)
 
 For each principal, who or what does it trust to do what?
