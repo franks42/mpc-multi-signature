@@ -1,0 +1,293 @@
+;; Statechart: Refresh reshare ceremony
+;;
+;; Source: data-dictionary.edn :ceremony/reshare-refresh
+;;
+;; Models the orchestrator-side per-ceremony lifecycle of a refresh
+;; reshare. The participant set is unchanged (same H, F, IC) and the
+;; wallet's public key is preserved; only the underlying polynomial
+;; is rotated. Output: a fresh shareset evaluating to the same
+;; public key, replacing the prior shareset bookkeeping-wise.
+;;
+;; --- statechart shape ---
+;; Specializes the keygen template like reshare-recovery, but:
+;;   - No member change. Old peers == new peers (3-party).
+;;   - Lighter authorization: holder request + Figure scheduled-
+;;     policy confirmation. No attestation, no recovery-intent, no
+;;     objection window. (No structural change → no high bar.)
+;;   - Continuity check at finalization: every party's reported new
+;;     public key must equal the original wallet public key (same
+;;     UC2-style invariant).
+;;
+;; Refresh is the periodic-hygiene companion to reshare-recovery.
+;; The two share machinery; the differences are in the gating and
+;; in whether membership changes.
+
+{:statechart/id           :statechart/ceremony-reshare-refresh
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/reshare-refresh
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle"
+ :statechart/template     :statechart/ceremony-keygen
+
+ :statechart/context
+ {:ceremony/id              :uuid
+  :ceremony/participants    [:actor/holder :actor/figure
+                             :actor/independent-custodian] ; unchanged
+  :ceremony/coordinator     :actor/figure
+  :ceremony/threshold       2 ; unchanged
+  :ceremony/scheme          :scheme/ot-based-ecdsa-secp256k1
+  :ceremony/deadline        :timestamp
+  :ceremony/wallet-pk       nil ; original public key, must be preserved
+  :ceremony/old-share-handle nil ; reference to current shareset (input)
+  :ceremony/new-share-handle nil ; fresh handle for the refreshed shareset (output)
+  :ceremony/per-party-state {:actor/holder              :party-state/awaiting
+                             :actor/figure              :party-state/awaiting
+                             :actor/independent-custodian :party-state/awaiting}
+  :ceremony/results         {} ; party -> :crypto/wallet-keygen-output handle
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  ;; Coordinator has prepared the ceremony record. The holder
+  ;; request and Figure's scheduled-policy confirmation have already
+  ;; been resolved out-of-band by the time begin-ceremony fires —
+  ;; the chart starts after that low-bar authorization is in place.
+  {:on {:event/begin-ceremony
+        {:target :state/starting
+         :actions [:action/record-deadline
+                   :action/record-handles-and-pk]}
+
+        :event/cancel
+        {:target :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  ;; Send :ceremony/begin-reshare to all participants. Note the
+  ;; begin-reshare message is shared with the recovery and divorce
+  ;; ceremonies — same shape, different participant list.
+  {:entry [:action/send-begin-reshare-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Three parallel regions, one per participant — same shape as
+  ;; keygen and reshare-recovery.
+  {:on {:event/protocol-message-emit
+        {:target :state/running
+         :actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:target  :state/running
+          :actions [:action/record-party-done
+                    :action/check-all-parties-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}
+
+   :statechart/parallel-regions
+   {:region/holder
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/holder)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/figure
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/figure)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/independent-custodian
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/independent-custodian)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}}}
+
+  :state/finalizing
+  ;; Continuity check (the load-bearing invariant): each party's
+  ;; reported new public key must equal the original wallet public
+  ;; key. Same check used by reshare-recovery.
+  {:entry [:action/collect-per-party-results
+           :action/refresh-public-key-preservation-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          ;; Public-key drift → fresh shareset is unusable for the
+          ;; existing wallet identity.
+          {:target :state/aborting
+           :actions [:action/record-error]}}}
+
+  :state/complete
+  {:type :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-new-shareset-handles
+           :action/append-to-audit-log]
+   :on   {}}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type :final
+   :entry [:action/notify-coordinator-failure
+           :action/append-to-audit-log]
+   :on   {}}}
+
+ :statechart/actions
+ {:action/record-handles-and-pk
+  "Capture :ceremony/old-share-handle, :ceremony/new-share-handle,
+   and :ceremony/wallet-pk from the begin-ceremony payload. The
+   wallet-pk is the continuity anchor against which the post-reshare
+   public keys will be checked."
+
+  :action/send-begin-reshare-to-all-participants
+  "Emit :ceremony/begin-reshare to each :ceremony/participant. The
+   begin shape is shared across reshare flavors; for refresh,
+   old-peers and new-peers are identical, old-threshold and
+   new-threshold are identical, and the wallet-pk continuity anchor
+   is supplied."
+
+  :action/refresh-public-key-preservation-check
+  "Refresh-specific finalization. For each party in
+   :ceremony/results, assert that their reported new public key
+   equals :ceremony/wallet-pk. If yes:
+   :event/finalization-passed. If no:
+   :event/finalization-failed with reason
+   :reason/public-key-drift. The same load-bearing invariant as
+   recovery — both ceremonies preserve the wallet's identity."
+
+  :action/persist-new-shareset-handles
+  "Store the per-party new-share handles such that subsequent
+   ceremonies reference them. **The old shareset is NOT
+   cryptographically erased** by this action — see the misconception
+   note in docs/ceremony-message-flows.md. Each party is responsible
+   for honestly deleting its own old share file as part of refresh
+   hygiene; the bookkeeping records the new shareset as canonical
+   but cannot enforce the deletion."
+
+  :action/append-to-audit-log
+  "Add an entry to :state/audit-log: ceremony id, timestamp, old
+   shareset handle (now superseded), new shareset handle. Mirror to
+   :state/ic-attestation-mirror as well so the IC has independent
+   record."}
+
+ :statechart/guards
+ {:guard/at-least-one-party-still-running "Same as keygen template."
+  :guard/all-parties-done-after-this-event "Same as keygen template."
+  :guard/originated-from "Same as keygen template."}
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/starting :state/running
+                          :state/finalizing]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting}
+
+  {:cross-cutting/name :deadline-elapsed-from-any-non-final-state
+   :cross-cutting/states [:state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting}]
+
+ :statechart/properties
+ [{:property/name :public-key-preservation-mandatory
+   :property/check ":state/complete must be reachable only via
+                    :state/finalizing's
+                    :action/refresh-public-key-preservation-check
+                    succeeding. Any path that bypasses this check
+                    is a violation of wallet continuity."}
+
+  {:property/name :no-membership-change
+   :property/check ":ceremony/participants is unchanged from the
+                    keygen-time set; this ceremony does not add or
+                    remove members. (For member-change reshare, see
+                    :ceremony/reshare-recovery and
+                    :ceremony/reshare-divorce.)"}
+
+  {:property/name :no-attestation-gate
+   :property/check "Refresh has no attestation-verification phase
+                    (the lighter authorization bar). For
+                    attestation-gated reshares see
+                    :ceremony/reshare-recovery and
+                    :ceremony/reshare-divorce."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete must be reachable only from
+                    :state/finalizing."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check ":state/failed must be reachable only from
+                    :state/aborting."}
+
+  {:property/name :rotation-benefit-requires-honest-deletion
+   :property/check "The 'rotates share material against future
+                    compromise' benefit of a refresh ceremony is
+                    contingent on each party honestly deleting its
+                    old share file. The protocol does not enforce
+                    deletion. See docs/ceremony-message-flows.md
+                    'Common misconception' subsection."}]}

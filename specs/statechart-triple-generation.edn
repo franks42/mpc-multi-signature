@@ -1,0 +1,244 @@
+;; Statechart: Triple-generation ceremony
+;;
+;; Source: data-dictionary.edn :ceremony/triple-generation
+;;
+;; Models the orchestrator-side per-ceremony lifecycle of a triple-
+;; generation ceremony. Holder + Figure pre-generate Beaver triples
+;; to stockpile for future signing. The IC is offline and not
+;; involved. Output: one or more triple shares per party, persisted
+;; locally for later consumption by a presign ceremony.
+;;
+;; --- statechart shape ---
+;; Specializes the keygen template:
+;;   - 2-party (holder + figure); IC absent.
+;;   - No authorization gate.
+;;   - No cross-party consistency check on the orchestrator side
+;;     (the protocol's own checks are sufficient; the orchestrator
+;;     just collects per-party handles).
+;;   - Triggered by holder request OR by Figure's stockpile-low
+;;     policy (the begin-ceremony event payload carries the
+;;     trigger reason for audit purposes).
+;;
+;; Convention: [event] denotes a transition trigger;
+;;             {action} denotes an entry/exit action;
+;;             (guard) denotes a transition guard.
+
+{:statechart/id           :statechart/ceremony-triple-generation
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/triple-generation
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle"
+ :statechart/template     :statechart/ceremony-keygen ; specializes; 2-party
+
+ :statechart/context
+ {:ceremony/id              :uuid
+  :ceremony/participants    [:actor/holder :actor/figure]
+  :ceremony/coordinator     :actor/figure
+  :ceremony/scheme          :scheme/ot-based-ecdsa-secp256k1
+  :ceremony/deadline        :timestamp
+  :ceremony/share-handle    nil ; :crypto/wallet-keygen-output reference (input)
+  :ceremony/triple-handle   nil ; fresh handle for the triple to be produced (output)
+  :ceremony/per-party-state {:actor/holder :party-state/awaiting
+                             :actor/figure :party-state/awaiting}
+  :ceremony/results         {} ; party -> :crypto/triple-share handle (echoed)
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  ;; Ceremony record exists; share-handle and a fresh triple-handle
+  ;; have been allocated by the coordinator. Parties not yet contacted.
+  {:on {:event/begin-ceremony
+        {:target :state/starting
+         :actions [:action/record-deadline
+                   :action/record-handles]}
+
+        :event/cancel
+        {:target :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  ;; Send :ceremony/begin-triples to holder and Figure. Wait for
+  ;; first protocol message.
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Two parallel regions, one per participant. Same shape as keygen
+  ;; but with the IC region absent.
+  {:on {:event/protocol-message-emit
+        {:target :state/running
+         :actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:target  :state/running
+          :actions [:action/record-party-done
+                    :action/check-all-parties-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}
+
+   :statechart/parallel-regions
+   {:region/holder
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/holder)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/figure
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/figure)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}}}
+
+  :state/finalizing
+  ;; No cross-party consistency check on the orchestrator side —
+  ;; the protocol's own VSS-style verification is what guards
+  ;; correctness. The orchestrator just collects per-party handles.
+  {:entry [:action/collect-per-party-results
+           :action/triple-shape-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          ;; Some party returned malformed handle metadata.
+          {:target :state/aborting
+           :actions [:action/record-error]}}}
+
+  :state/complete
+  {:type :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles]
+   :on   {}}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type :final
+   :entry [:action/notify-coordinator-failure]
+   :on   {}}}
+
+ :statechart/actions
+ {:action/record-handles
+  "Capture :ceremony/share-handle (input) and :ceremony/triple-handle
+   (output) from the begin-ceremony event payload."
+
+  :action/send-begin-to-all-participants
+  "Emit :ceremony/begin-triples to holder and Figure. Each begin
+   message includes the participant's role, peer list, threshold,
+   share-handle (input) and triple-handle (output)."
+
+  :action/triple-shape-check
+  "Triple-generation has no cross-party consistency check (the
+   protocol's VSS verification handles correctness). This action
+   only confirms structural well-formedness: every participant in
+   :ceremony/participants reported a :ceremony/complete with a
+   :result/triple-handle echoing the assigned handle. On pass:
+   :event/finalization-passed; on fail: :event/finalization-failed
+   with :reason/missing-or-malformed-result."}
+
+ :statechart/guards
+ {:guard/at-least-one-party-still-running "Same as keygen template."
+  :guard/all-parties-done-after-this-event "Same as keygen template."
+  :guard/originated-from "Same as keygen template."}
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/starting :state/running
+                          :state/finalizing]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting}
+
+  {:cross-cutting/name :deadline-elapsed-from-any-non-final-state
+   :cross-cutting/states [:state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting}
+
+  {:cross-cutting/name :no-IC-events
+   :cross-cutting/notes "The IC is not a participant. Any event
+                         claiming origin :actor/independent-custodian
+                         in this ceremony is a protocol violation
+                         and should be logged and ignored."}]
+
+ :statechart/properties
+ [{:property/name :IC-not-participant
+   :property/check "No :ceremony/participants entry includes
+                    :actor/independent-custodian. The IC is offline
+                    by design for triple-generation."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel (directly or via cross-cutting)."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete must be reachable only from
+                    :state/finalizing."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check ":state/failed must be reachable only from
+                    :state/aborting (no direct path from running
+                    states bypasses cleanup)."}
+
+  {:property/name :triples-are-one-time-use
+   :property/check "Each triple-handle produced by this ceremony is
+                    consumed by exactly one subsequent presign
+                    ceremony. Reuse would compromise the share
+                    scalars via nonce collision in the resulting
+                    signature. The ceremony itself does not enforce
+                    this — the presign ceremony's
+                    :action/select-triple is responsible — but the
+                    invariant lives downstream of this output."}]}

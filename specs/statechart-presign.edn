@@ -1,0 +1,265 @@
+;; Statechart: Presign ceremony
+;;
+;; Source: data-dictionary.edn :ceremony/presign
+;;
+;; Models the orchestrator-side per-ceremony lifecycle of a presign
+;; ceremony. Holder + Figure consume one Beaver triple to produce a
+;; presignature, persisted in each party's stockpile for later
+;; consumption by exactly one sign ceremony. The IC is offline.
+;;
+;; --- statechart shape ---
+;; Specializes the keygen template, mirrors triple-generation in
+;; participant set:
+;;   - 2-party (holder + figure); IC absent.
+;;   - Two cryptographic inputs (share + triple); one output (presig).
+;;   - The triple is CONSUMED by this ceremony — the presign's
+;;     :action/release-triple marks the input handle as spent so it
+;;     cannot be referenced again. (Reuse would leak share scalars
+;;     when the resulting presignature is consumed in a sign.)
+;;   - No authorization gate; presign is preparation, not commitment.
+
+{:statechart/id           :statechart/ceremony-presign
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/presign
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle"
+ :statechart/template     :statechart/ceremony-keygen ; specializes; 2-party
+
+ :statechart/context
+ {:ceremony/id              :uuid
+  :ceremony/participants    [:actor/holder :actor/figure]
+  :ceremony/coordinator     :actor/figure
+  :ceremony/scheme          :scheme/ot-based-ecdsa-secp256k1
+  :ceremony/deadline        :timestamp
+  :ceremony/share-handle    nil ; :crypto/wallet-keygen-output reference (input)
+  :ceremony/triple-handle   nil ; :crypto/triple-share reference (input, consumed)
+  :ceremony/presig-handle   nil ; fresh handle for the presignature (output)
+  :ceremony/per-party-state {:actor/holder :party-state/awaiting
+                             :actor/figure :party-state/awaiting}
+  :ceremony/results         {} ; party -> :crypto/presignature handle
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  {:on {:event/begin-ceremony
+        {:target :state/starting
+         :actions [:action/record-deadline
+                   :action/record-handles
+                   :action/reserve-triple]}
+
+        :event/cancel
+        {:target :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target :state/aborting
+           :actions [:action/record-error
+                     :action/release-triple-reservation]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason
+                     :action/release-triple-reservation]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout
+                     :action/release-triple-reservation]}}}
+
+  :state/running
+  {:on {:event/protocol-message-emit
+        {:target :state/running
+         :actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:target  :state/running
+          :actions [:action/record-party-done
+                    :action/check-all-parties-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party
+                   :action/release-triple-reservation]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason
+                   :action/release-triple-reservation]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout
+                   :action/release-triple-reservation]}}
+
+   :statechart/parallel-regions
+   {:region/holder
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/holder)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/figure
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/figure)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}}}
+
+  :state/finalizing
+  ;; Like triple-generation, no orchestrator-side cross-party
+  ;; consistency check. The protocol's VSS-style checks govern
+  ;; correctness. This state confirms shape only and consumes the
+  ;; triple permanently on success.
+  {:entry [:action/collect-per-party-results
+           :action/presig-shape-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target :state/aborting
+           :actions [:action/record-error
+                     :action/release-triple-reservation]}}}
+
+  :state/complete
+  {:type :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles
+           :action/consume-triple]
+   :on   {}}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type :final
+   :entry [:action/notify-coordinator-failure]
+   :on   {}}}
+
+ :statechart/actions
+ {:action/record-handles
+  "Capture :ceremony/share-handle (keygen output, input),
+   :ceremony/triple-handle (input, will be consumed) and
+   :ceremony/presig-handle (output) from the begin-ceremony payload."
+
+  :action/reserve-triple
+  "Mark :ceremony/triple-handle as in-use in
+   :state/holder-triple-stockpile and :state/figure-triple-stockpile
+   so a concurrent presign cannot consume the same triple. Reservation
+   is released on abort/error/cancel; consumed permanently only on
+   :state/complete."
+
+  :action/release-triple-reservation
+  "Undo :action/reserve-triple. Used on every abort/error path so
+   the triple becomes available for a future presign attempt."
+
+  :action/consume-triple
+  "Mark :ceremony/triple-handle as permanently spent. Removes it
+   from both holder and Figure stockpiles atomically. Called on
+   entry to :state/complete only — a successful presign 'burns'
+   the triple, since the resulting presignature carries the
+   triple's nonce material into a one-time-use signing primitive."
+
+  :action/send-begin-to-all-participants
+  "Emit :ceremony/begin-presign to holder and Figure. Each begin
+   message carries: role, peer list, threshold, share-handle,
+   triple-handle, presig-handle."
+
+  :action/presig-shape-check
+  "Structural well-formedness check (NOT cryptographic verification):
+   every participant reported :ceremony/complete with a
+   :result/presig-handle echoing the assigned handle. On pass:
+   :event/finalization-passed; on fail: :event/finalization-failed
+   with :reason/missing-or-malformed-result."}
+
+ :statechart/guards
+ {:guard/at-least-one-party-still-running "Same as keygen template."
+  :guard/all-parties-done-after-this-event "Same as keygen template."
+  :guard/originated-from "Same as keygen template."}
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/starting :state/running
+                          :state/finalizing]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes "All abort paths must release the triple
+                         reservation so it remains available."}
+
+  {:cross-cutting/name :deadline-elapsed-from-any-non-final-state
+   :cross-cutting/states [:state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting}
+
+  {:cross-cutting/name :no-IC-events
+   :cross-cutting/notes "The IC is not a participant. Any event
+                         claiming origin :actor/independent-custodian
+                         in this ceremony is a protocol violation
+                         and should be logged and ignored."}]
+
+ :statechart/properties
+ [{:property/name :IC-not-participant
+   :property/check "No :ceremony/participants entry includes
+                    :actor/independent-custodian."}
+
+  {:property/name :triple-consumed-iff-complete
+   :property/check ":action/consume-triple must be invoked on entry
+                    to :state/complete (consumed) but NOT on any
+                    abort path. Conversely,
+                    :action/release-triple-reservation must fire on
+                    every abort path so the triple is reusable."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete must be reachable only from
+                    :state/finalizing."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check ":state/failed must be reachable only from
+                    :state/aborting."}
+
+  {:property/name :presigs-are-one-time-use
+   :property/check "Each presig-handle produced by this ceremony is
+                    consumed by exactly one subsequent sign
+                    ceremony. The sign chart's
+                    :action/release-presignature enforces this; this
+                    chart sets up the invariant by producing a fresh
+                    handle per ceremony."}]}

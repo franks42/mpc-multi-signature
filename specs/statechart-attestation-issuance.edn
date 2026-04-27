@@ -1,0 +1,261 @@
+;; Statechart: Attestation-issuance ceremony
+;;
+;; Source: data-dictionary.edn :ceremony/attestation-issuance
+;;
+;; Models the per-ceremony lifecycle of a credential-issuance
+;; interaction between a holder and a Trusted Attestation Service
+;; (TAS). The TAS authenticates the holder using its specific
+;; method (KYC, commitment-secret reveal, social-recovery contact
+;; confirmation, etc.) and issues a signed attestation that
+;; downstream structural ceremonies (recovery, divorce) accept as
+;; an authorization input.
+;;
+;; --- statechart shape ---
+;; This ceremony is structurally distinct from the threshold ones:
+;;   - TWO actors only: holder + a single TAS. No multi-party MPC.
+;;   - The TAS is the coordinator (it drives the authentication and
+;;     decides whether to issue).
+;;   - No protocol-message relay between peers (only one peer pair
+;;     exists, and the dialog is request/response).
+;;   - The output is a signed credential, not a share. The TAS is
+;;     the sole signer.
+;;   - The authentication method is TAS-type-specific; the chart
+;;     abstracts it as a single :state/authenticating with TAS-
+;;     specific actions inside.
+;;
+;; Concrete TAS types (each implements :action/run-tas-authentication
+;; differently):
+;;   - :actor/kyc-tas         — identity verification per KYC policy
+;;   - :actor/commitment-tas  — verifies revealed secret matches
+;;                              previously registered commitment hash
+;;   - :actor/social-tas      — collects k-of-n contact confirmations
+
+{:statechart/id           :statechart/ceremony-attestation-issuance
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/attestation-issuance
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "TAS-side per-ceremony lifecycle (TAS
+                            drives; holder participates as
+                            authentication subject)"
+
+ :statechart/context
+ {:ceremony/id              :uuid
+  :ceremony/holder          :actor/holder
+  :ceremony/tas             nil ; :actor/kyc-tas, :actor/commitment-tas, etc.
+  :ceremony/coordinator     nil ; equals :ceremony/tas
+  :ceremony/method          nil ; :method/kyc, :method/commitment-reveal, :method/social
+  :ceremony/deadline        :timestamp
+  :ceremony/wallet-pk       nil ; the wallet whose recovery this attestation will support
+  :ceremony/auth-context    nil ; method-specific (KYC packet, revealed secret, contact list)
+  :ceremony/result-attestation nil ; :crypto/identity-attestation handle on success
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  ;; Holder has submitted an attestation request to the TAS.
+  ;; The TAS records the request and prepares to run authentication.
+  {:on {:event/begin-ceremony
+        {:target :state/authenticating
+         :actions [:action/record-deadline
+                   :action/record-method-and-context]}
+
+        :event/cancel
+        {:target :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/authenticating
+  ;; TAS-specific authentication. The exact dialogue depends on the
+  ;; TAS type:
+  ;;   - KYC: present documents to a verifier (out-of-band per the
+  ;;     TAS's policy); record the verifier's positive determination.
+  ;;   - Commitment: receive holder-revealed secret; check
+  ;;     SHA-256(secret) against registered commitment hash.
+  ;;   - Social: dispatch confirmation requests to k-of-n contacts;
+  ;;     wait for threshold to confirm.
+  ;; The chart abstracts these as a single state; the TAS-specific
+  ;; logic lives in :action/run-tas-authentication.
+  {:entry [:action/run-tas-authentication
+           :action/start-deadline-timer]
+   :on   {:event/auth-pass
+          {:target :state/issuing
+           :actions [:action/record-auth-pass]}
+
+          :event/auth-fail
+          {:target :state/failed
+           :actions [:action/record-auth-fail]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/issuing
+  ;; Authentication passed. TAS constructs and signs the
+  ;; attestation. This is a local computation on the TAS — no
+  ;; further holder interaction.
+  {:entry [:action/build-attestation
+           :action/sign-attestation]
+   :on   {:event/issuance-complete
+          {:target :state/delivering}
+
+          :event/issuance-failed
+          ;; Internal TAS error during build/sign (not auth failure).
+          {:target :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}}}
+
+  :state/delivering
+  ;; TAS sends the signed attestation to the holder.
+  {:entry [:action/deliver-attestation-to-holder]
+   :on   {:event/holder-acked-attestation
+          {:target :state/complete}
+
+          :event/delivery-timeout
+          ;; Holder didn't acknowledge in time. The attestation has
+          ;; already been signed and exists in the TAS's audit log;
+          ;; the holder can request redelivery later.
+          {:target :state/aborting
+           :actions [:action/record-error]}}}
+
+  :state/complete
+  {:type :final
+   :entry [:action/append-to-tas-audit-log
+           :action/notify-coordinator-success]
+   :on   {}}
+
+  :state/aborting
+  ;; Used for non-auth-failure aborts (timeout, cancel, internal
+  ;; error). Kept distinct from :state/failed because :failed has a
+  ;; specific meaning here: authentication itself failed and the
+  ;; TAS issued a clean rejection.
+  {:entry [:action/start-abort-timeout
+           :action/append-to-tas-audit-log]
+   :on   {:event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type :final
+   :entry [:action/notify-coordinator-failure]
+   :on   {}}}
+
+ :statechart/actions
+ {:action/record-method-and-context
+  "Capture :ceremony/method and :ceremony/auth-context from the
+   begin-ceremony payload. The auth-context shape depends on the
+   method:
+     - :method/kyc: a packet of identity documents/proofs
+     - :method/commitment-reveal: a revealed secret to be checked
+       against the registered commitment hash
+     - :method/social: a list of contact identifiers and their
+       confirmation tokens"
+
+  :action/run-tas-authentication
+  "TAS-type-specific authentication. Polymorphic on
+   :ceremony/method:
+     - :method/kyc → run KYC verification per the TAS's policy.
+       Typically involves out-of-band steps (operator review, ID
+       document scan, etc.); the action returns asynchronously
+       once a determination is reached.
+     - :method/commitment-reveal → compute SHA-256 of the revealed
+       secret and compare with the registered commitment hash for
+       :ceremony/wallet-pk. Pass iff equal AND the secret hasn't
+       been previously used (one-shot reveal).
+     - :method/social → dispatch confirmation requests to the
+       contacts listed in :ceremony/auth-context, gather
+       confirmations, pass iff k-of-n threshold met within
+       deadline.
+   Emits :event/auth-pass or :event/auth-fail."
+
+  :action/record-auth-pass
+  "Record positive authentication determination in the TAS's audit
+   log along with method-specific evidence (so the determination
+   is reviewable later)."
+
+  :action/record-auth-fail
+  "Record negative authentication determination plus reason. The
+   ceremony transitions to :state/failed and the holder receives a
+   clean rejection."
+
+  :action/build-attestation
+  "Construct the :crypto/identity-attestation (or method-specific
+   variant) payload. Includes: TAS identity, holder identity,
+   wallet-pk, method used, freshness timestamp, freshness window."
+
+  :action/sign-attestation
+  "TAS signs the attestation payload with its long-term Ed25519
+   signing key. The TAS's public key is registered in
+   :state/address-policy-registry under the wallet-pk's
+   acceptable-attestations list — so downstream verifiers
+   (Figure, IC during recovery/divorce) can check the signature."
+
+  :action/deliver-attestation-to-holder
+  "Send the signed attestation to the holder's process via the
+   established channel (the holder's bb-wrapper inbound stream)."
+
+  :action/append-to-tas-audit-log
+  "Add an entry to the TAS's local audit log: ceremony id,
+   timestamp, holder identity (per the authentication), method,
+   outcome, attestation handle (on success), reason (on failure)."}
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/authenticating
+                          :state/issuing :state/delivering]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting}
+
+  {:cross-cutting/name :deadline-elapsed-from-active-states
+   :cross-cutting/states [:state/authenticating :state/delivering]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting
+   :cross-cutting/notes ":state/issuing has no deadline transition
+                         because attestation construction and
+                         signing are bounded local operations; if
+                         they fail, :event/issuance-failed fires
+                         within milliseconds."}]
+
+ :statechart/properties
+ [{:property/name :authentication-precedes-issuance
+   :property/check ":state/issuing must be reachable only from
+                    :state/authenticating via :event/auth-pass.
+                    No path bypasses authentication."}
+
+  {:property/name :failed-meaning
+   :property/check ":state/failed represents *clean rejection* —
+                    either authentication failed or the holder
+                    cancelled. Transient errors (timeouts, internal
+                    TAS errors) route through :state/aborting
+                    first. The terminal classification matters
+                    because :state/failed corresponds to a
+                    consumable rejection the holder can act on,
+                    while :state/aborting → :state/failed records
+                    a more ambiguous outcome."}
+
+  {:property/name :TAS-is-sole-signer
+   :property/check "Only the TAS signs the attestation. The holder
+                    is the *subject* of the attestation, not a
+                    co-signer. The trust model is 'this TAS asserts
+                    that this holder authenticated against this
+                    method'; downstream verifiers trust the TAS,
+                    not the holder."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel."}
+
+  {:property/name :one-shot-on-method-commitment-reveal
+   :property/check "When :ceremony/method is :method/commitment-
+                    reveal, the revealed secret must be marked as
+                    consumed in the TAS's commitment registry on
+                    :event/auth-pass. A second reveal of the same
+                    secret should not pass — commitment reveals are
+                    one-shot by design."}]}

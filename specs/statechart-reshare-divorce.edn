@@ -1,0 +1,433 @@
+;; Statechart: Divorce reshare ceremony
+;;
+;; Source: data-dictionary.edn :ceremony/reshare-divorce
+;;
+;; Models the orchestrator-side per-ceremony lifecycle of a divorce
+;; reshare. The holder voluntarily removes Figure from the wallet,
+;; optionally replacing Figure with a new co-signer. Output: a fresh
+;; shareset for the new participant set, with the same wallet
+;; public key preserved.
+;;
+;; --- statechart shape ---
+;; Specializes the keygen template; structurally similar to
+;; reshare-recovery, with these differences:
+;;   - Figure is being removed and is NOT a participant. Authorization
+;;     verification is the IC's responsibility alone — Figure cannot
+;;     vouch for its own removal.
+;;   - Two output configurations are possible:
+;;       (a) 2-of-2 between holder and IC (no replacement).
+;;       (b) 2-of-3 between holder, IC, and a designated new co-signer.
+;;     The begin-ceremony payload's :ceremony/new-cosigner field
+;;     selects the configuration.
+;;   - Authorization gate is single-gated (IC only) instead of
+;;     reshare-recovery's two-gate pattern (Figure + IC).
+;;   - Optional objection window per address policy, same as recovery.
+;;
+;; This chart is the closest sibling to reshare-recovery; consult
+;; that chart for the message-flow shape — only the gating differs.
+
+{:statechart/id           :statechart/ceremony-reshare-divorce
+ :statechart/version      "0.1.0"
+ :statechart/ceremony     :ceremony/reshare-divorce
+ :statechart/dictionary   "data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle"
+ :statechart/template     :statechart/ceremony-keygen
+
+ :statechart/context
+ {:ceremony/id              :uuid
+  :ceremony/old-participants [:actor/holder :actor/figure
+                              :actor/independent-custodian]
+  :ceremony/new-participants nil ; computed at begin-ceremony from new-cosigner
+  :ceremony/new-cosigner     nil ; :actor/* keyword OR :none
+  :ceremony/coordinator      :actor/independent-custodian ; not Figure
+  :ceremony/old-threshold    2
+  :ceremony/new-threshold    2 ; preserved across divorce
+  :ceremony/scheme           :scheme/ot-based-ecdsa-secp256k1
+  :ceremony/deadline         :timestamp
+  :ceremony/wallet-pk        nil ; original public key, must be preserved
+  :ceremony/attestation      nil ; :crypto/identity-attestation (holder identity)
+  :ceremony/divorce-intent   nil ; :crypto/divorce-intent (holder-signed)
+  :ceremony/objection-window-required? false
+  :ceremony/objection-window-deadline  nil
+  :ceremony/ic-gate-status   :gate-status/pending  ; :pending, :passed, :rejected
+  :ceremony/per-party-state  {} ; populated at :state/starting from :ceremony/new-participants
+  :ceremony/results          {}
+  :ceremony/error            nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  {:on {:event/begin-ceremony
+        {:target :state/authorization-gate
+         :actions [:action/record-deadline
+                   :action/load-address-policy
+                   :action/extract-attestation-and-intent
+                   :action/compute-new-participants]}
+
+        :event/cancel
+        {:target :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/authorization-gate
+  ;; Single-gate verification: IC alone verifies the holder's
+  ;; identity-attestation and divorce-intent. Figure is not
+  ;; consulted (Figure is the party being removed). If the IC
+  ;; rejects, the ceremony aborts.
+  ;;
+  ;; Note the asymmetry from reshare-recovery: there, Figure and IC
+  ;; each run independent verifications; here only one party
+  ;; verifies because the other is the subject. The trust property
+  ;; is "the holder + the IC together can remove Figure, and Figure
+  ;; alone cannot prevent it."
+  {:entry [:action/dispatch-gate-verification-to-ic]
+   :on   {:event/ic-gate-pass
+          [{:target :state/objection-window
+            :actions [:action/record-ic-gate-pass]
+            :guards  [(guard/objection-window-required)]}
+           {:target :state/starting
+            :actions [:action/record-ic-gate-pass]
+            :guards  [(guard/objection-window-not-required)]}]
+
+          :event/ic-gate-fail
+          {:target :state/aborting
+           :actions [:action/record-ic-gate-fail]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/objection-window
+  ;; Optional. For high-value wallets the address policy may require
+  ;; a publish-then-execute window. Holder can object via a separate
+  ;; channel if they observe an unauthorized divorce attempt — though
+  ;; in this ceremony the holder is presumed to have INITIATED the
+  ;; divorce, so the objection mechanism here is more about catching
+  ;; impersonation of the holder than disagreement.
+  {:entry [:action/publish-divorce-intent
+           :action/start-objection-window-timer]
+   :on   {:event/objection-window-elapsed
+          {:target :state/starting}
+
+          :event/objection-raised
+          {:target :state/aborting
+           :actions [:action/record-objection]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/starting
+  ;; Send :ceremony/begin-reshare only to new-participants. Figure
+  ;; (the removed party) is NOT contacted. The holder + IC + (optionally)
+  ;; new-cosigner exchange protocol messages.
+  {:entry [:action/send-begin-reshare-to-new-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Two-or-three parallel regions depending on whether a new
+  ;; co-signer was designated. Per :ceremony/new-cosigner; populated
+  ;; dynamically by :action/init-per-party-state-from-new-participants.
+  {:on {:event/protocol-message-emit
+        {:target :state/running
+         :actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:target  :state/running
+          :actions [:action/record-party-done
+                    :action/check-all-parties-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}
+
+   ;; Per-participant regions follow the same shape as
+   ;; reshare-recovery's :state/running. The exact set of regions
+   ;; depends on the new participant set:
+   ;;   - 2-of-2 case: :region/holder + :region/independent-custodian
+   ;;   - 2-of-3 case: those two + :region/new-cosigner
+   ;; Region content is identical structurally to keygen's
+   ;; :region/holder template, with the appropriate
+   ;; (guard/originated-from :actor/X) substitution.
+   :statechart/parallel-regions
+   {:region/holder
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/holder)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    :region/independent-custodian
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from :actor/independent-custodian)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}
+
+    ;; The :region/new-cosigner is conditional — present only if
+    ;; :ceremony/new-cosigner is non-:none. Implementations should
+    ;; instantiate this region only in the 2-of-3 variant; in the
+    ;; 2-of-2 variant the region is absent and the running state
+    ;; has only the two regions above.
+    :region/new-cosigner
+    {:initial :party-state/awaiting
+     :states  {:party-state/awaiting
+               ;; Guard parameter is :ceremony/new-cosigner from context.
+               {:on {:event/protocol-message-emit
+                     {:target  :party-state/relaying
+                      :guards  [(guard/originated-from-new-cosigner)]}}}
+
+               :party-state/relaying
+               {:entry [:action/route-message]
+                :on    {:auto :party-state/awaiting}}
+
+               :party-state/done {}
+               :party-state/errored {}}}}}
+
+  :state/finalizing
+  ;; Same continuity check as reshare-recovery: every new
+  ;; participant's reported new public key must equal the original
+  ;; wallet public key. Public-key drift = ceremony failure.
+  {:entry [:action/collect-per-party-results
+           :action/divorce-public-key-preservation-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target :state/aborting
+           :actions [:action/record-error]}}}
+
+  :state/complete
+  {:type :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-new-shareset-handles
+           :action/retire-figure-share-record
+           :action/append-to-audit-log]
+   :on   {}}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type :final
+   :entry [:action/notify-coordinator-failure
+           :action/append-to-audit-log]
+   :on   {}}}
+
+ :statechart/actions
+ {:action/load-address-policy
+  "Look up the wallet's policy in :state/address-policy-registry by
+   :ceremony/wallet-pk. Sets :ceremony/objection-window-required?
+   and the acceptable-attestations list."
+
+  :action/extract-attestation-and-intent
+  "Pull :crypto/identity-attestation and :crypto/divorce-intent from
+   the begin-ceremony event payload into context fields."
+
+  :action/compute-new-participants
+  "Read :ceremony/new-cosigner from the begin payload. If :none,
+   set :ceremony/new-participants to [:actor/holder
+   :actor/independent-custodian] (2-of-2). If a role keyword,
+   set :ceremony/new-participants to [:actor/holder
+   :actor/independent-custodian <new-cosigner>] (2-of-3)."
+
+  :action/dispatch-gate-verification-to-ic
+  "Send a gate-verification request to ic-bb carrying the
+   attestation and divorce-intent. The IC verifies signatures,
+   freshness, policy match, and that the divorce-intent is signed
+   by the registered holder identity. ic-bb then emits
+   :event/ic-gate-pass or :event/ic-gate-fail."
+
+  :action/record-ic-gate-pass
+  "Set :ceremony/ic-gate-status to :gate-status/passed."
+
+  :action/record-ic-gate-fail
+  "Set :ceremony/ic-gate-status to :gate-status/rejected; capture
+   the rejection reason in :ceremony/error."
+
+  :action/publish-divorce-intent
+  "Append a 'divorce pending' record to :state/audit-log and
+   :state/ic-attestation-mirror. Makes the in-flight ceremony
+   visible to anyone monitoring those logs — particularly anyone
+   who could detect impersonation of the holder."
+
+  :action/send-begin-reshare-to-new-participants
+  "Emit :ceremony/begin-reshare to each member of
+   :ceremony/new-participants. Each begin message includes the
+   actor's role, both old and new participant lists, both
+   thresholds, the wallet-pk continuity anchor, and the actor's
+   :ceremony/old-handle if they had a previous share. Figure (in
+   old-participants but not new) is NOT contacted."
+
+  :action/divorce-public-key-preservation-check
+  "Divorce-specific finalization. For each new participant in
+   :ceremony/results, assert that their reported new public key
+   equals :ceremony/wallet-pk. If yes:
+   :event/finalization-passed. If no:
+   :event/finalization-failed with reason
+   :reason/public-key-drift."
+
+  :action/persist-new-shareset-handles
+  "Store the per-party new-share handles for subsequent ceremonies.
+   The old shareset handles are retained in the audit log but
+   marked superseded — see misconception note in
+   docs/ceremony-message-flows.md."
+
+  :action/retire-figure-share-record
+  "Mark Figure's share-record (in :state/address-policy-registry +
+   audit log) as 'retired in divorce ceremony <id>' so future
+   ceremonies refuse to reference it. **Bookkeeping only — does
+   NOT cryptographically erase Figure's local share file.**
+   Operationally, Figure should delete the file as part of the
+   divorce settlement, but the protocol cannot enforce that."
+
+  :action/append-to-audit-log
+  "Add an entry to :state/audit-log: ceremony id, attestations
+   verified, divorce-intent verified, removed party (Figure),
+   new-cosigner (or :none), outcome. Mirror to
+   :state/ic-attestation-mirror."}
+
+ :statechart/guards
+ {:guard/objection-window-required
+  "True iff :ceremony/objection-window-required? in context is true."
+
+  :guard/objection-window-not-required
+  "True iff :ceremony/objection-window-required? in context is false."
+
+  :guard/at-least-one-party-still-running "Same as keygen template."
+  :guard/all-parties-done-after-this-event "Same as keygen template."
+  :guard/originated-from "Same as keygen template."
+
+  :guard/originated-from-new-cosigner
+  "True iff the firing event was emitted by the actor named in
+   :ceremony/new-cosigner. Parameterized by context, not by
+   actor keyword."}
+
+ :statechart/cross-cutting
+ [{:cross-cutting/name :cancel-from-any-non-final-state
+   :cross-cutting/states [:state/pending :state/authorization-gate
+                          :state/objection-window :state/starting
+                          :state/running :state/finalizing]
+   :cross-cutting/event :event/cancel
+   :cross-cutting/target :state/aborting}
+
+  {:cross-cutting/name :deadline-elapsed
+   :cross-cutting/states [:state/authorization-gate :state/objection-window
+                          :state/starting :state/running :state/finalizing]
+   :cross-cutting/event :event/deadline-elapsed
+   :cross-cutting/target :state/aborting}
+
+  {:cross-cutting/name :Figure-not-contacted
+   :cross-cutting/notes "Figure is in :ceremony/old-participants but
+                         not in :ceremony/new-participants. The
+                         protocol's tolerance for absent old
+                         participants applies here as in recovery
+                         (the surviving old participants — holder +
+                         IC — meet the old threshold of 2). Figure
+                         exchanges no protocol messages in this
+                         ceremony."}]
+
+ :statechart/properties
+ [{:property/name :IC-is-verification-authority
+   :property/check ":action/dispatch-gate-verification-to-ic must be
+                    invoked on entry to :state/authorization-gate.
+                    No equivalent dispatch-to-figure exists — Figure
+                    is the party being removed and cannot vouch for
+                    its own removal."}
+
+  {:property/name :public-key-preservation-mandatory
+   :property/check ":state/complete must be reachable only via
+                    :state/finalizing's
+                    :action/divorce-public-key-preservation-check
+                    succeeding. Same load-bearing invariant as
+                    recovery."}
+
+  {:property/name :objection-window-respected
+   :property/check "If :ceremony/objection-window-required? is true,
+                    :state/starting must be reachable only via
+                    :state/objection-window."}
+
+  {:property/name :Figure-not-in-new-participants
+   :property/check ":ceremony/new-participants must NOT include
+                    :actor/figure. The whole point of divorce is to
+                    remove Figure."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states that is not
+                    :type :final must have a transition for
+                    :event/cancel."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete must be reachable only from
+                    :state/finalizing."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check ":state/failed must be reachable only from
+                    :state/aborting."}
+
+  {:property/name :rotation-benefit-requires-honest-deletion
+   :property/check "Same as reshare-refresh and reshare-recovery:
+                    the rotation benefit is contingent on every
+                    surviving party honestly deleting its old share
+                    file. Particularly important here for the IC
+                    (whose old share is now part of a no-longer-
+                    canonical shareset) and for Figure (whose share
+                    has been retired in the bookkeeping but whose
+                    local file persists). See
+                    docs/ceremony-message-flows.md."}]}

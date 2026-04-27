@@ -125,12 +125,13 @@ The plan is in `docs/recovery-exploration-harness-design.md` under
 Status at a glance:
 
 - **Stage 0 (done)** — data dictionary + EDN message vocabulary.
-- **Stage 0.5 (partial)** — four of eight ceremony charts written
-  (`statechart-keygen.edn`, `statechart-sign.edn`,
-  `statechart-reshare-recovery.edn`,
-  `statechart-share-possession-proof.edn`). Remaining: divorce,
-  refresh, attestation-issuance, triple-generation, presign. Stage 5+
-  work likely needs charts for some of these.
+- **Stage 0.5 (done 2026-04-26)** — all nine ceremony charts written
+  in `specs/`: keygen, sign, reshare-recovery, reshare-divorce,
+  reshare-refresh, triple-generation, presign,
+  share-possession-proof, attestation-issuance. Each chart parses
+  cleanly via `clojure.edn/read-string`. The threshold-ceremony
+  charts share a common shape (specializing the keygen template);
+  attestation-issuance has a distinct shape (TAS-driven, no MPC).
 - **Stage 1 (done)** — null orchestrator + three null parties round-
   tripping a stubbed `:keygen` ceremony in EDN. Tag
   `v0.1.0-stage-1-null-orchestrator`.
