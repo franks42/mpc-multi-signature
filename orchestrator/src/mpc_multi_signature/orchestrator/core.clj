@@ -116,6 +116,80 @@
   [orch opts]
   (ceremony/run-reshare orch opts))
 
+(defn refresh
+  "Run a refresh-reshare ceremony — same membership, fresh polynomial.
+   Convenience wrapper over `reshare` that fixes
+   old-participants == new-participants. The wallet's public key is
+   preserved; each participant ends up with a fresh share that is an
+   evaluation of a different polynomial than before. Authorization is
+   the lightest of the reshare flavors (per chart: holder request +
+   Figure scheduled-policy confirmation; the harness skips the gate
+   like Stage 4 does for reshare-recovery).
+
+   `opts` requires :participants (the unchanged share-holder set),
+   :old-share-handle, :public-key-hex. Optional :threshold
+   (defaults to 2), :deadline-ms.
+
+   Note: per the misconception note in
+   docs/ceremony-message-flows.md, the rotation benefit of a refresh
+   is contingent on each party honestly deleting its old share file.
+   The protocol can't enforce that. The harness here also doesn't
+   delete on its own — Stage 5c hygiene work is where that lives."
+  [orch {:keys [participants threshold old-share-handle
+                public-key-hex deadline-ms]
+         :or   {threshold 2}}]
+  (assert participants     "refresh: :participants required")
+  (assert old-share-handle "refresh: :old-share-handle required")
+  (assert public-key-hex   "refresh: :public-key-hex required")
+  (ceremony/run-reshare orch
+                        (cond-> {:old-participants  (vec participants)
+                                 :new-participants  (vec participants)
+                                 :old-threshold     threshold
+                                 :new-threshold     threshold
+                                 :old-share-handle  old-share-handle
+                                 :public-key-hex    public-key-hex}
+                          deadline-ms (assoc :deadline-ms deadline-ms))))
+
+(defn divorce
+  "Run a divorce-reshare ceremony — Figure (or any party) is removed
+   from the wallet, optionally replaced by a new co-signer. The
+   wallet's public key is preserved.
+
+   `opts` requires :old-participants (the wallet's current share-
+   holder set), :removed-party (the role being removed),
+   :old-share-handle, :public-key-hex. Optional :replacement (a
+   role keyword to add in place of the removed party — yields a
+   new-participants set of (n-1) + 1 = n; if omitted, new-
+   participants is the old set minus the removed party). Optional
+   :old-threshold, :new-threshold, :deadline-ms.
+
+   Authorization (per chart: IC alone verifies; Figure cannot
+   vouch for its own removal) is skipped at this stage — same as
+   Stage 4 reshare-recovery. Stage 5c.3 will introduce the
+   executable gate."
+  [orch {:keys [old-participants removed-party replacement
+                old-threshold new-threshold
+                old-share-handle public-key-hex deadline-ms]
+         :or   {old-threshold 2 new-threshold 2}}]
+  (assert old-participants "divorce: :old-participants required")
+  (assert removed-party    "divorce: :removed-party required")
+  (assert old-share-handle "divorce: :old-share-handle required")
+  (assert public-key-hex   "divorce: :public-key-hex required")
+  (assert (some #{removed-party} old-participants)
+          "divorce: :removed-party must be in :old-participants")
+  (let [survivors        (vec (remove #{removed-party} old-participants))
+        new-participants (if replacement
+                           (conj survivors replacement)
+                           survivors)]
+    (ceremony/run-reshare orch
+                          (cond-> {:old-participants (vec old-participants)
+                                   :new-participants new-participants
+                                   :old-threshold    old-threshold
+                                   :new-threshold    new-threshold
+                                   :old-share-handle old-share-handle
+                                   :public-key-hex   public-key-hex}
+                            deadline-ms (assoc :deadline-ms deadline-ms)))))
+
 (defn share-possession-proof
   "Run a share-possession proof ceremony. `opts` requires
    :share-handle and :challenge-context-hex."
