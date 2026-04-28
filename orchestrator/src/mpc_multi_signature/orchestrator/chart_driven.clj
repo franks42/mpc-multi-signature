@@ -89,12 +89,14 @@
   [state _event]
   state)
 
-(defn- triple-shape-check
-  "Triple-gen has no orchestrator-side cross-party consistency check
-   (the protocol's VSS handles correctness). The shape check just
-   confirms every participant returned a result map (the actual handle
-   was minted up front by the orchestrator, not echoed by parties),
-   then queues :event/finalization-passed (or -failed)."
+(defn- check-results-collected
+  "Generic shape check for ceremonies with no orchestrator-side
+   cross-party consistency check (triple-gen, presign). Confirms every
+   participant returned a result map, then queues
+   :event/finalization-passed (or -failed). Charts that need this
+   reference it via ceremony-specific action keywords (e.g.
+   :action/triple-shape-check, :action/presig-shape-check) — both
+   resolve to this same function."
   [{:keys [::participants ::pending-events :ceremony/results] :as state}
    _event]
   (let [ok? (every? #(some? (get results %)) participants)]
@@ -228,7 +230,10 @@
    :action/route-message                    route-message
    :action/record-party-done                record-party-done
    :action/collect-per-party-results        collect-per-party-results
-   :action/triple-shape-check               triple-shape-check
+   ;; Two ceremony-specific action keywords aliased to the same
+   ;; "every party returned a result" check function.
+   :action/triple-shape-check               check-results-collected
+   :action/presig-shape-check               check-results-collected
    :action/keygen-consistency-check         keygen-consistency-check
    :action/notify-coordinator-success       notify-coordinator-success
    :action/persist-result-handles           persist-result-handles
@@ -405,6 +410,46 @@
                        :ceremony/participants  peers
                        :ceremony/share-handle  share-handle
                        :ceremony/triple-handle triple-handle}]
+    (run-chart-fsm! orch peers chart-path domain-ctx make-begin build-result
+                    deadline-ms)))
+
+(defn run-presign-via-chart
+  "Chart-driven equivalent of ceremony/run-presign. Consumes a
+   share-handle (from keygen) and a triple-handle (from triple-gen);
+   produces a fresh presig-handle. On success:
+     {:presig-handle <uuid> :handles {role <uuid>} :ceremony/id <uuid>}"
+  [{:keys [participant-ids identity-pubkeys] :as orch} participants
+   {:keys [threshold deadline-ms share-handle triple-handle chart-path]
+    :or   {threshold 2
+           deadline-ms 60000
+           chart-path  "../specs/executable/statechart-presign.edn"}}]
+  (assert share-handle  "run-presign-via-chart: :share-handle required")
+  (assert triple-handle "run-presign-via-chart: :triple-handle required")
+  (let [ceremony-id   (uuidv7/uuidv7)
+        presig-handle (uuidv7/uuidv7)
+        peers         (vec participants)
+        ids           (select-keys participant-ids peers)
+        peer-pubkeys  (select-keys identity-pubkeys peers)
+        make-begin    (fn [me]
+                        {:msg/type                 :ceremony/begin-presign
+                         :ceremony/id              ceremony-id
+                         :ceremony/me              me
+                         :ceremony/peers           peers
+                         :ceremony/participant-ids ids
+                         :ceremony/peer-pubkeys    peer-pubkeys
+                         :ceremony/threshold       threshold
+                         :ceremony/share-handle    share-handle
+                         :ceremony/triple-handle   triple-handle
+                         :ceremony/presig-handle   presig-handle})
+        build-result  (fn [_state]
+                        {:presig-handle presig-handle
+                         :handles       (into {} (for [r peers] [r presig-handle]))
+                         :ceremony/id   ceremony-id})
+        domain-ctx    {:ceremony/id            ceremony-id
+                       :ceremony/participants  peers
+                       :ceremony/share-handle  share-handle
+                       :ceremony/triple-handle triple-handle
+                       :ceremony/presig-handle presig-handle}]
     (run-chart-fsm! orch peers chart-path domain-ctx make-begin build-result
                     deadline-ms)))
 

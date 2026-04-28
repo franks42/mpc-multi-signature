@@ -1,0 +1,137 @@
+;; Statechart: Presign ceremony — EXECUTABLE variant
+;;
+;; Companion documentation chart: ../statechart-presign.edn
+;;
+;; Same execution-correct patterns as the triple-generation
+;; executable chart. See docs/statechart-best-practices.md.
+;;
+;; Presign-specific:
+;;   - 2 parties (holder + figure); IC offline.
+;;   - Inputs: :ceremony/share-handle (keygen output) +
+;;             :ceremony/triple-handle (triple-generation output, two
+;;             triples consumed together by one presign).
+;;   - Output: :ceremony/presig-handle, persisted per-party.
+;;   - No orchestrator-side consistency check (the protocol's own
+;;     checks govern correctness). Shape check only confirms every
+;;     participant returned a result.
+
+{:statechart/id           :statechart/ceremony-presign-exec
+ :statechart/version      "0.2.0"
+ :statechart/ceremony     :ceremony/presign
+ :statechart/dictionary   "../data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle, executable"
+
+ :statechart/context
+ {:ceremony/id              nil
+  :ceremony/participants    nil
+  :ceremony/share-handle    nil   ; input (keygen output)
+  :ceremony/triple-handle   nil   ; input (triple-generation output)
+  :ceremony/presig-handle   nil   ; output
+  :ceremony/per-party-state {}
+  :ceremony/results         {}
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  {:on {:event/begin-ceremony
+        {:target  :state/starting
+         :actions [:action/record-handles]}
+
+        :event/cancel
+        {:target  :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target  :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  {:on {:event/protocol-message-emit
+        {:actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:actions [:action/record-party-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}}
+
+  :state/finalizing
+  ;; No orchestrator-side check; just confirm every participant
+  ;; returned a result, then queue :event/finalization-passed.
+  {:entry [:action/collect-per-party-results
+           :action/presig-shape-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/complete
+  {:type  :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles]}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type  :final
+   :entry [:action/notify-coordinator-failure]}}
+
+ :statechart/properties
+ [{:property/name :complete-only-via-finalizing
+   :property/check ":state/complete reachable only from :state/finalizing."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every non-final state has an :event/cancel transition."}
+
+  {:property/name :triple-consumed-on-success
+   :property/check "Each triple-handle consumed by a presign cannot be
+                    reused. The bookkeeping happens at presign-complete
+                    time downstream of this chart."}]}
