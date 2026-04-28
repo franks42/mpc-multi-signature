@@ -28,15 +28,22 @@ context changes from actions whose return value is a
   [state {:keys [from result]}]
   (assoc-in state [:ceremony/per-party-state from] :party-state/done))
 
-;; RIGHT — fsm/assign wraps the function so its return becomes
-;; ContextAssignment, which clj-statecharts recognizes and applies
-(def record-party-done
-  (fsm/assign
-   (fn [state {:keys [from result]}]
-     (-> state
-         (assoc-in [:ceremony/per-party-state from] :party-state/done)
-         (assoc-in [:ceremony/results from] result)))))
+;; RIGHT — defaction wraps the function in fsm/assign so its return
+;; becomes a ContextAssignment that clj-statecharts recognizes and
+;; applies. Side effects (atom mutations, message dispatch) are still
+;; allowed inside the body — they just happen before the wrapped
+;; state is returned.
+(defaction record-party-done
+  (fn [state {:keys [from result]}]
+    (-> state
+        (assoc-in [:ceremony/per-party-state from] :party-state/done)
+        (assoc-in [:ceremony/results from] result))))
 ```
+
+The `defaction` macro is in `chart_driven.clj` and exists specifically
+to make this requirement structural rather than mnemonic. Don't write
+plain `(def X (fsm/assign ...))` forms — use `defaction` so future
+reviewers can grep for "context-updating actions" by macro name.
 
 Pure side-effect actions (sending messages, queueing events,
 delivering to a promise) don't need `fsm/assign` — they return state

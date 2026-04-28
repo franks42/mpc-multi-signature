@@ -1,5 +1,9 @@
 {:lint-as
- {taoensso.trove/log! clojure.core/identity}
+ {taoensso.trove/log! clojure.core/identity
+  ;; defaction expands to `(def name (fsm/assign body))`; tell
+  ;; clj-kondo to lint it like clojure.core/def so the bound symbol
+  ;; is visible to subsequent code.
+  mpc-multi-signature.orchestrator.chart-driven/defaction clojure.core/def}
 
  :linters
  {:unresolved-symbol      {:level :error}

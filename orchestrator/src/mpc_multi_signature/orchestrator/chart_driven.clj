@@ -25,16 +25,39 @@
 ;; Two flavors:
 ;;
 ;;   - SIDE-EFFECT actions (sending messages, queueing events,
-;;     delivering to a promise): plain (fn [state event] -> state).
+;;     delivering to a promise): plain (defn- ... [state event] -> state).
 ;;     Return state unchanged; clj-statecharts threads the prior state.
 ;;
-;;   - CONTEXT-UPDATING actions (record-party-done etc.): wrapped with
-;;     `(fsm/assign (fn [state event] -> state'))`. clj-statecharts
-;;     ignores plain return values from actions and only applies an
-;;     update if the action returns a ContextAssignment record (which
-;;     fsm/assign produces). Without the wrapper, context updates are
-;;     silently discarded — a non-obvious gotcha but documented in
-;;     the impl source (statecharts/impl.cljc execute fn).
+;;   - CONTEXT-UPDATING actions: defined with `defaction` below. The
+;;     macro wraps the body in `(fsm/assign ...)` so the return value
+;;     becomes a ContextAssignment record that clj-statecharts
+;;     recognizes and applies. Without the wrapper, context updates
+;;     are silently discarded (statecharts/impl.cljc execute fn lines
+;;     161-169 — the killer gotcha that pattern #1 in the
+;;     best-practices doc warns about). Using `defaction` for every
+;;     context-updating action makes the requirement structural
+;;     instead of mnemonic.
+
+(defmacro ^:private defaction
+  "Define a context-updating FSM action. The body must be a function
+   `(fn [state event] -> state')`. The macro wraps it in `fsm/assign`
+   so the return value is treated as a context update by
+   clj-statecharts.
+
+   Usage:
+     (defaction record-party-done
+       (fn [state {:keys [from result]}]
+         (-> state
+             (assoc-in [:ceremony/per-party-state from] :party-state/done)
+             (assoc-in [:ceremony/results from] result))))
+
+   Side effects (atom mutations, message dispatch) are allowed inside
+   the body — they happen before the wrapped state is returned. For
+   actions that ONLY have side effects and don't update context,
+   write a plain `defn-` instead and return state unchanged."
+  [name body]
+  `(def ~(vary-meta name assoc :private true)
+     (fsm/assign ~body)))
 
 (defn- send-begin-to-all-participants
   [{:keys [::orch ::participants ::make-begin] :as state} _event]
@@ -76,12 +99,11 @@
                  :data  {:msg-type msg-type}})))
   state)
 
-(def ^:private record-party-done
-  (fsm/assign
-   (fn [state {:keys [from result]}]
-     (-> state
-         (assoc-in [:ceremony/per-party-state from] :party-state/done)
-         (assoc-in [:ceremony/results from] result)))))
+(defaction record-party-done
+  (fn [state {:keys [from result]}]
+    (-> state
+        (assoc-in [:ceremony/per-party-state from] :party-state/done)
+        (assoc-in [:ceremony/results from] result))))
 
 (defn- collect-per-party-results
   ;; Triple-gen carries per-party results in :ceremony/results already;
@@ -104,91 +126,85 @@
            (if ok? :event/finalization-passed :event/finalization-failed))
     state))
 
-(def ^:private sign-consistency-check
-  "Sign-specific finalization check. The coordinator returns a
-   signature; non-coordinators return nil for the signature field.
-   Verify exactly one party (the named coordinator) returned a non-nil
-   :result/signature-hex; populate :ceremony/signature-hex; queue
-   :event/finalization-passed (or -failed)."
-  (fsm/assign
-   (fn [{:keys [::pending-events :ceremony/coordinator :ceremony/results]
-         :as state} _event]
-     (let [coord-sig    (get-in results [coordinator :result/signature-hex])
-           non-coord-sigs (->> (dissoc results coordinator)
-                               vals
-                               (map :result/signature-hex)
-                               (remove nil?))]
-       (cond
-         (nil? coord-sig)
-         (do (swap! pending-events conj :event/finalization-failed)
-             (assoc state :ceremony/error :reason/no-signature-from-coordinator))
+;; Sign-specific finalization check. The coordinator returns a
+;; signature; non-coordinators return nil for the signature field.
+;; Verify exactly one party (the named coordinator) returned a non-nil
+;; :result/signature-hex; populate :ceremony/signature-hex; queue
+;; :event/finalization-passed (or -failed).
+(defaction sign-consistency-check
+  (fn [{:keys [::pending-events :ceremony/coordinator :ceremony/results]
+        :as state} _event]
+    (let [coord-sig    (get-in results [coordinator :result/signature-hex])
+          non-coord-sigs (->> (dissoc results coordinator)
+                              vals
+                              (map :result/signature-hex)
+                              (remove nil?))]
+      (cond
+        (nil? coord-sig)
+        (do (swap! pending-events conj :event/finalization-failed)
+            (assoc state :ceremony/error :reason/no-signature-from-coordinator))
 
-         (seq non-coord-sigs)
-         (do (swap! pending-events conj :event/finalization-failed)
-             (assoc state :ceremony/error :reason/non-coordinator-emitted-signature))
+        (seq non-coord-sigs)
+        (do (swap! pending-events conj :event/finalization-failed)
+            (assoc state :ceremony/error :reason/non-coordinator-emitted-signature))
 
-         :else
-         (do (swap! pending-events conj :event/finalization-passed)
-             (assoc state :ceremony/signature-hex coord-sig)))))))
+        :else
+        (do (swap! pending-events conj :event/finalization-passed)
+            (assoc state :ceremony/signature-hex coord-sig))))))
 
-(def ^:private reshare-consistency-check
-  "Reshare-specific finalization check. Every new participant must
-   report the SAME public-key-hex AND it must equal
-   :ceremony/expected-public-key-hex (continuity anchor passed in at
-   ceremony start). Populates :ceremony/public-key +
-   :ceremony/verification-shares on success."
-  (fsm/assign
-   (fn [{:keys [::pending-events :ceremony/results
-                :ceremony/expected-public-key-hex]
-         :as state} _event]
-     (let [pks (->> results vals (map :result/public-key-hex) (into #{}))]
-       (cond
-         (and (= 1 (count pks))
-              (= (first pks) expected-public-key-hex))
-         (do (swap! pending-events conj :event/finalization-passed)
-             (-> state
-                 (assoc :ceremony/public-key (first pks))
-                 (assoc :ceremony/verification-shares
-                        (into {} (for [[r m] results]
-                                   [r (:result/verification-share-hex m)])))))
+;; Reshare-specific finalization check. Every new participant must
+;; report the SAME public-key-hex AND it must equal
+;; :ceremony/expected-public-key-hex (continuity anchor passed in at
+;; ceremony start). Populates :ceremony/public-key +
+;; :ceremony/verification-shares on success.
+(defaction reshare-consistency-check
+  (fn [{:keys [::pending-events :ceremony/results
+               :ceremony/expected-public-key-hex]
+        :as state} _event]
+    (let [pks (->> results vals (map :result/public-key-hex) (into #{}))]
+      (cond
+        (and (= 1 (count pks))
+             (= (first pks) expected-public-key-hex))
+        (do (swap! pending-events conj :event/finalization-passed)
+            (-> state
+                (assoc :ceremony/public-key (first pks))
+                (assoc :ceremony/verification-shares
+                       (into {} (for [[r m] results]
+                                  [r (:result/verification-share-hex m)])))))
 
-         (and (= 1 (count pks))
-              (not= (first pks) expected-public-key-hex))
-         (do (swap! pending-events conj :event/finalization-failed)
-             (assoc state :ceremony/error :reason/public-key-not-preserved))
+        (and (= 1 (count pks))
+             (not= (first pks) expected-public-key-hex))
+        (do (swap! pending-events conj :event/finalization-failed)
+            (assoc state :ceremony/error :reason/public-key-not-preserved))
 
-         :else
-         (do (swap! pending-events conj :event/finalization-failed)
-             (assoc state :ceremony/error :reason/public-key-disagreement)))))))
+        :else
+        (do (swap! pending-events conj :event/finalization-failed)
+            (assoc state :ceremony/error :reason/public-key-disagreement))))))
 
-(def ^:private keygen-consistency-check
-  "Keygen-specific finalization check. Reads per-party results and
-   verifies all parties report the same public-key-hex. On agreement:
-   stores :ceremony/public-key + :ceremony/verification-shares in
-   context, queues :event/finalization-passed. On disagreement:
-   stores :ceremony/error reason, queues :event/finalization-failed.
+;; Keygen-specific finalization check. Reads per-party results and
+;; verifies all parties report the same public-key-hex. On agreement:
+;; stores :ceremony/public-key + :ceremony/verification-shares in
+;; context, queues :event/finalization-passed. On disagreement:
+;; stores :ceremony/error reason, queues :event/finalization-failed.
+(defaction keygen-consistency-check
+  (fn [{:keys [::pending-events :ceremony/results] :as state} _event]
+    (let [pks (->> results vals (map :result/public-key-hex) (into #{}))]
+      (cond
+        (= 1 (count pks))
+        (do (swap! pending-events conj :event/finalization-passed)
+            (-> state
+                (assoc :ceremony/public-key (first pks))
+                (assoc :ceremony/verification-shares
+                       (into {} (for [[r m] results]
+                                  [r (:result/verification-share-hex m)])))))
 
-   Wrapped in fsm/assign because it updates context. Side effect on
-   the pending-events atom happens before the assignment is returned."
-  (fsm/assign
-   (fn [{:keys [::pending-events :ceremony/results] :as state} _event]
-     (let [pks (->> results vals (map :result/public-key-hex) (into #{}))]
-       (cond
-         (= 1 (count pks))
-         (do (swap! pending-events conj :event/finalization-passed)
-             (-> state
-                 (assoc :ceremony/public-key (first pks))
-                 (assoc :ceremony/verification-shares
-                        (into {} (for [[r m] results]
-                                   [r (:result/verification-share-hex m)])))))
+        (zero? (count pks))
+        (do (swap! pending-events conj :event/finalization-failed)
+            (assoc state :ceremony/error :reason/no-results))
 
-         (zero? (count pks))
-         (do (swap! pending-events conj :event/finalization-failed)
-             (assoc state :ceremony/error :reason/no-results))
-
-         :else
-         (do (swap! pending-events conj :event/finalization-failed)
-             (assoc state :ceremony/error :reason/public-key-disagreement)))))))
+        :else
+        (do (swap! pending-events conj :event/finalization-failed)
+            (assoc state :ceremony/error :reason/public-key-disagreement))))))
 
 (defn- notify-coordinator-success
   "Generic success-notification. The ceremony-specific result shape is
@@ -221,25 +237,21 @@
   (swap! pending-events conj :event/abort-timeout-elapsed)
   state)
 
-(def ^:private record-error
-  (fsm/assign
-   (fn [state {:keys [error]}]
-     (assoc state :ceremony/error (or error :reason/error)))))
+(defaction record-error
+  (fn [state {:keys [error]}]
+    (assoc state :ceremony/error (or error :reason/error))))
 
-(def ^:private record-erroring-party
-  (fsm/assign
-   (fn [state {:keys [from]}]
-     (assoc state :ceremony/erroring-party from))))
+(defaction record-erroring-party
+  (fn [state {:keys [from]}]
+    (assoc state :ceremony/erroring-party from)))
 
-(def ^:private record-cancel-reason
-  (fsm/assign
-   (fn [state _event]
-     (assoc state :ceremony/error :reason/cancel))))
+(defaction record-cancel-reason
+  (fn [state _event]
+    (assoc state :ceremony/error :reason/cancel)))
 
-(def ^:private record-timeout
-  (fsm/assign
-   (fn [state _event]
-     (assoc state :ceremony/error :reason/timeout))))
+(defaction record-timeout
+  (fn [state _event]
+    (assoc state :ceremony/error :reason/timeout)))
 
 (defn- record-handles
   ;; Handles are placed in context at FSM init; structural marker.
