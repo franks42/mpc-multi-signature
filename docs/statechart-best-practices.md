@@ -261,6 +261,64 @@ actions (`send-begin-to-all-participants`, `start-deadline-timer`)
 both run before the FSM settles. This is the right place for
 ceremony-startup side effects.
 
+## 10. Distinguish transient wait states from terminal aborts
+
+**Forward-looking pattern (added before Stage 5c policy work).** The
+six chart-driven ceremonies migrated so far (keygen, triple-gen,
+presign, sign, share-proof, reshare) all share a binary
+success/failure shape: any error → `:state/aborting` → `:state/failed`.
+That's correct for protocol-level failures (a party crashed, a
+deadline elapsed, a consistency check failed) — these are *terminal*.
+
+Stage 5c business-logic ceremonies will introduce a different
+failure shape: **transient pauses**. Examples:
+
+- An attestation request is pending but the TAS hasn't replied yet.
+- A multi-party authorization gate is waiting for the second
+  signoff (one party agreed; the other is offline or thinking).
+- A publication/objection window is open and the timer hasn't
+  elapsed.
+
+For these, transitioning straight to `:state/aborting` is wrong —
+the ceremony is **still alive**, just waiting. Use a real
+intermediate state instead:
+
+```clojure
+:state/awaiting-attestation
+{:entry [:action/request-attestation :action/start-attestation-timer]
+ :on    {:event/attestation-received
+         {:target :state/policy-check
+          :actions [:action/record-attestation]}
+
+         :event/attestation-rejected
+         {:target  :state/aborting
+          :actions [:action/record-rejection]}
+
+         :event/attestation-timeout
+         ;; Genuinely terminal: TAS unreachable for too long.
+         {:target  :state/aborting
+          :actions [:action/record-timeout]}}}
+```
+
+Three guidelines for Stage 5c chart authors:
+
+1. **A waiting state is not the same as `:state/running`.** Give it
+   its own name (`:state/awaiting-X`) so the chart's structure
+   reveals what the system is doing.
+2. **Every wait state needs both an "answer arrived" and a "timed
+   out" transition.** Otherwise the FSM can stick indefinitely.
+3. **A retry policy belongs in chart structure, not buried in an
+   action.** If a request can be retried N times, model the retry
+   loop with a counter in context and a guard
+   (`:guard/retries-exhausted`) — don't hide it inside
+   `:action/maybe-retry`.
+
+Counter-example (anti-pattern): a single `:action/wait-for-X` that
+busy-loops in a side effect, returning state unchanged until done.
+The FSM has no idea the ceremony is waiting; observers can't tell
+"alive but waiting" from "stuck"; deadlines don't fire because no
+event is being processed.
+
 ## Anti-patterns we hit
 
 | Anti-pattern | Symptom | Fix |
@@ -271,6 +329,8 @@ ceremony-startup side effects.
 | Region states `:done`/`:errored` never reached | Dead structure; chart parses but documents lies | Either give them real transitions or remove the regions |
 | Action checks for a result field the wrapper doesn't send | `:event/finalization-failed` fires unexpectedly | Read what bb actually returns; don't assume |
 | Dropped `:event/protocol-message-emit` handler "because the ceremony has no protocol exchange" | bb wrappers time out during Noise handshake; "EOF during Noise handshake" thrown | Keep the handler — Noise handshake bytes still flow as `:protocol/private` (pattern #4b) |
+| Modeled "waiting for an external answer" by going to `:state/aborting` on timeout, with no distinct wait state | Chart can't tell "alive but waiting" from "failed"; observers can't see what's blocking; retries become opaque | Use a named `:state/awaiting-X` with explicit answer-arrived and timeout transitions (pattern #10) |
+| Synthetic action queues an event but a previous action in the same `:entry` list throws | Pending-events queue gets out of sync; the FSM hangs waiting for an event that was never fully queued | Order entry actions so context updates that affect guards happen *before* the action that queues the synthetic event; check pending-events drain in error paths |
 
 ## Working examples
 
