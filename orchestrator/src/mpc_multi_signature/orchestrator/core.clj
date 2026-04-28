@@ -9,7 +9,7 @@
    signature with signet (BouncyCastle-backed, independent of the
    threshold-signatures crate's own verify path)."
   (:require [cedn.core :as cedn]
-            [mpc-multi-signature.orchestrator.ceremony :as ceremony]
+            [mpc-multi-signature.orchestrator.chart-driven :as ceremony]
             [mpc-multi-signature.orchestrator.party-connection :as party]
             [mpc-multi-signature.orchestrator.telemetry :as telemetry]
             [taoensso.trove :as log])
@@ -90,31 +90,31 @@
 
 (defn keygen
   ([orch participants] (keygen orch participants {}))
-  ([orch participants opts] (ceremony/run-keygen orch participants opts)))
+  ([orch participants opts] (ceremony/run-keygen-via-chart orch participants opts)))
 
 (defn triple-generation
   ([orch participants] (triple-generation orch participants {}))
-  ([orch participants opts] (ceremony/run-triple-generation orch participants opts)))
+  ([orch participants opts] (ceremony/run-triple-generation-via-chart orch participants opts)))
 
 (defn presign
   "Run a presign ceremony.
    `opts` requires :share-handle and :triple-handle from earlier ceremonies."
   [orch participants opts]
-  (ceremony/run-presign orch participants opts))
+  (ceremony/run-presign-via-chart orch participants opts))
 
 (defn sign
   "Run a sign ceremony with a pre-computed digest.
    `opts` requires :coordinator (role keyword), :share-handle,
    :presig-handle, :digest-hex (32-byte hex string)."
   [orch participants opts]
-  (ceremony/run-sign orch participants opts))
+  (ceremony/run-sign-via-chart orch participants opts))
 
 (defn reshare
   "Run a reshare ceremony.
    `opts` requires :old-participants, :new-participants,
    :old-share-handle, :public-key-hex (continuity anchor)."
   [orch opts]
-  (ceremony/run-reshare orch opts))
+  (ceremony/run-reshare-via-chart orch opts))
 
 (defn refresh
   "Run a refresh-reshare ceremony — same membership, fresh polynomial.
@@ -141,7 +141,7 @@
   (assert participants     "refresh: :participants required")
   (assert old-share-handle "refresh: :old-share-handle required")
   (assert public-key-hex   "refresh: :public-key-hex required")
-  (ceremony/run-reshare orch
+  (ceremony/run-reshare-via-chart orch
                         (cond-> {:old-participants  (vec participants)
                                  :new-participants  (vec participants)
                                  :old-threshold     threshold
@@ -181,7 +181,7 @@
         new-participants (if replacement
                            (conj survivors replacement)
                            survivors)]
-    (ceremony/run-reshare orch
+    (ceremony/run-reshare-via-chart orch
                           (cond-> {:old-participants (vec old-participants)
                                    :new-participants new-participants
                                    :old-threshold    old-threshold
@@ -194,7 +194,7 @@
   "Run a share-possession proof ceremony. `opts` requires
    :share-handle and :challenge-context-hex."
   [orch participants opts]
-  (ceremony/run-share-possession-proof orch participants opts))
+  (ceremony/run-share-possession-proof-via-chart orch participants opts))
 
 (defn- bind-context
   "Compute the per-party bound challenge context for an identity-share
@@ -401,7 +401,7 @@
                                                                    {:role r})))
                                        pub     (hex->bytes pub-hex)]]
                              [r (bytes->hex (bind-context nonce pub))]))
-        proof-result (ceremony/run-share-possession-proof
+        proof-result (ceremony/run-share-possession-proof-via-chart
                       orch participants
                       {:share-handle                  share-handle
                        :challenge-context-hex-by-role ctx-by-role
