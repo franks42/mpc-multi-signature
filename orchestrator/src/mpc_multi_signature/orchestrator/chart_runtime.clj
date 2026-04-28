@@ -103,10 +103,15 @@
   "Translate a single transition map: :target stays, :actions is
    resolved against the registry, :guards is collapsed into :guard."
   [action-registry guard-registry tx]
-  (cond-> tx
-    (:actions tx) (assoc :actions (resolve-actions action-registry (:actions tx)))
-    (:guards  tx) (-> (assoc :guard (resolve-guards guard-registry (:guards tx)))
-                      (dissoc :guards))))
+  (let [tx (if (:actions tx)
+             (assoc tx :actions (resolve-actions action-registry (:actions tx)))
+             tx)
+        tx (if (:guards tx)
+             (-> tx
+                 (assoc :guard (resolve-guards guard-registry (:guards tx)))
+                 (dissoc :guards))
+             tx)]
+    tx))
 
 (defn- translate-on-entry
   "An :on map's value can be:
@@ -127,16 +132,14 @@
 (declare translate-state)
 
 (defn- translate-on-map
-  "Translate a state's :on map. Special key :auto in our charts is
-   mapped to clj-statecharts's :always (eventless transition)."
+  "Translate a state's :on map (excluding :auto which is hoisted to
+   the state-level :always by the caller, since clj-statecharts
+   expects :always at state level, not nested inside :on)."
   [action-registry guard-registry on-map]
   (when on-map
     (reduce-kv
      (fn [acc event-kw on-val]
-       (let [translated (translate-on-entry action-registry guard-registry on-val)]
-         (case event-kw
-           :auto (assoc acc :always translated)
-           (assoc acc event-kw translated))))
+       (assoc acc event-kw (translate-on-entry action-registry guard-registry on-val)))
      {}
      on-map)))
 
@@ -171,25 +174,40 @@
      :type           — preserved (e.g. :final)
      :initial        — preserved
      :entry / :exit  — action lists, resolved
-     :on             — events map, resolved
-     :statechart/states           — recursed as :states
+     :on             — events map, resolved (with :auto hoisted out)
+     :auto in :on    — hoisted to state-level :always (eventless
+                       transition; clj-statecharts expects :always
+                       at state level, not nested inside :on)
+     :statechart/states OR :states — recursed as :states. The
+       chart-level convention uses :statechart/states; per-region
+       inner states use plain :states. We accept both.
      :statechart/parallel-regions — recursed as :regions, with
                                     :type :parallel set on this node"
   [action-registry guard-registry node]
-  (let [{children :statechart/states
-         regions  :statechart/parallel-regions} node
-        on-map  (:on node)
+  (let [;; Children may live under either key.
+        children      (or (:statechart/states node) (:states node))
+        regions       (:statechart/parallel-regions node)
+        raw-on        (:on node)
+        auto-entry    (:auto raw-on)
+        on-without-auto (dissoc raw-on :auto)
+        translated-on (when (seq on-without-auto)
+                        (translate-on-map action-registry guard-registry
+                                          on-without-auto))
+        translated-always
+        (when auto-entry
+          (translate-on-entry action-registry guard-registry auto-entry))
         entries (:entry node)
         exits   (:exit node)]
     (cond-> (dissoc node :statechart/states :statechart/parallel-regions
-                    :on :entry :exit)
-      entries  (assoc :entry (resolve-actions action-registry entries))
-      exits    (assoc :exit  (resolve-actions action-registry exits))
-      on-map   (assoc :on    (translate-on-map action-registry guard-registry on-map))
-      children (assoc :states (translate-states action-registry guard-registry children))
-      regions  (assoc :type :parallel
-                      :regions (translate-parallel-regions
-                                action-registry guard-registry regions)))))
+                    :states :on :entry :exit)
+      entries           (assoc :entry  (resolve-actions action-registry entries))
+      exits             (assoc :exit   (resolve-actions action-registry exits))
+      translated-on     (assoc :on     translated-on)
+      translated-always (assoc :always translated-always)
+      children          (assoc :states (translate-states action-registry guard-registry children))
+      regions           (assoc :type :parallel
+                               :regions (translate-parallel-regions
+                                         action-registry guard-registry regions)))))
 
 ;; ============================================================
 ;; Top-level translation
