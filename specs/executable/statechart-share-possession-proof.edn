@@ -1,0 +1,179 @@
+;; Statechart: Share-possession proof ceremony — EXECUTABLE variant
+;;
+;; Companion documentation chart: ../statechart-share-possession-proof.edn
+;;
+;; Stage 5a ceremony: each participating share-holder produces a non-
+;; interactive Schnorr PoK against a verifier-supplied challenge
+;; context. With :ceremony/binding-mode? true, parties additionally
+;; sign the proof bytes with their Ed25519 identity key, welding the
+;; proof to their identity.
+;;
+;; Two execution-relevant differences from triple-gen / keygen:
+;;
+;;   1. POSSIBLY single-party. The ceremony can be requested from any
+;;      subset of share-holders, down to one. So both :state/starting
+;;      and :state/running need vector-of-guarded transitions on
+;;      :event/ceremony-complete — for a 1-party ceremony, the first
+;;      complete is also the last and goes straight to :finalizing.
+;;
+;;   2. No peer-to-peer crypto protocol. Each party computes its proof
+;;      locally; no protocol messages flow between crypto-cores.
+;;      However, the bb wrapper still establishes pairwise Noise_KK
+;;      sessions before computing the proof, and those handshake
+;;      messages flow through the orchestrator as :protocol/private
+;;      (see docs/statechart-best-practices.md pattern #5b on transport
+;;      vs crypto-protocol traffic). So this chart still needs the
+;;      :event/protocol-message-emit handler to route handshake
+;;      messages — same shape as triple-gen / keygen.
+;;
+;; See docs/statechart-best-practices.md.
+
+{:statechart/id           :statechart/ceremony-share-possession-proof-exec
+ :statechart/version      "0.2.0"
+ :statechart/ceremony     :ceremony/share-possession-proof
+ :statechart/dictionary   "../data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle, executable"
+
+ :statechart/context
+ {:ceremony/id              nil
+  :ceremony/participants    nil
+  :ceremony/share-handle    nil
+  :ceremony/binding-mode?   false
+  :ceremony/per-party-state {}
+  :ceremony/results         {}
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  {:on {:event/begin-ceremony
+        {:target  :state/starting
+         :actions [:action/record-handles]}
+
+        :event/cancel
+        {:target  :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  ;; A :ceremony/complete may arrive before any Noise handshake
+  ;; traffic (parties' compute is local). Vector of guarded
+  ;; transitions handles single-party ceremonies (first complete is
+  ;; also the last → straight to :finalizing).
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          ;; Noise handshake bytes between bb wrappers — transport
+          ;; layer, not crypto protocol. Route and advance to running.
+          {:target  :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-complete
+          [{:target  :state/running
+            :actions [:action/record-party-done]
+            :guards  [(guard/at-least-one-party-still-running)]}
+           {:target  :state/finalizing
+            :actions [:action/record-party-done]
+            :guards  [(guard/all-parties-done-after-this-event)]}]
+
+          :event/ceremony-error
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Routes Noise handshake bytes (transport) but no crypto-protocol
+  ;; bytes (proof computation is local). The progress event toward
+  ;; :finalizing is :event/ceremony-complete.
+  {:on {:event/protocol-message-emit
+        {:actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:actions [:action/record-party-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}}
+
+  :state/finalizing
+  ;; The ceremony does NOT cryptographically verify the proofs —
+  ;; that is the verifier's responsibility. Finalization is purely
+  ;; structural: every requested participant emitted a result. The
+  ;; check-results-collected fn passes by construction here, since
+  ;; we only reach :finalizing when every party recorded as done.
+  {:entry [:action/collect-per-party-results
+           :action/share-proof-shape-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/complete
+  {:type  :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles]}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type  :final
+   :entry [:action/notify-coordinator-failure]}}
+
+ :statechart/properties
+ [{:property/name :transport-routing-only
+   :property/check ":event/protocol-message-emit handlers route Noise
+                    handshake bytes (transport layer). No crypto-
+                    protocol bytes flow between parties — the proof
+                    is computed locally."}
+
+  {:property/name :handles-single-party
+   :property/check "For a 1-participant ceremony, :state/starting's
+                    first :event/ceremony-complete transitions
+                    directly to :state/finalizing via the
+                    guard/all-parties-done-after-this-event branch."}
+
+  {:property/name :no-cryptographic-verification
+   :property/check "The ceremony does not verify proofs cryptographically.
+                    That is the verifier's responsibility, intentionally
+                    decoupled so independent verifiers can each check
+                    transcripts under their own trust assumptions."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every non-final state has an :event/cancel transition."}]}

@@ -230,10 +230,14 @@
    :action/route-message                    route-message
    :action/record-party-done                record-party-done
    :action/collect-per-party-results        collect-per-party-results
-   ;; Two ceremony-specific action keywords aliased to the same
-   ;; "every party returned a result" check function.
+   ;; Ceremony-specific action keywords aliased to the same
+   ;; "every party returned a result" check function. Used by
+   ;; ceremonies that have no orchestrator-side cross-party check —
+   ;; the protocol's own verification or the verifier's downstream
+   ;; check governs correctness.
    :action/triple-shape-check               check-results-collected
    :action/presig-shape-check               check-results-collected
+   :action/share-proof-shape-check          check-results-collected
    :action/keygen-consistency-check         keygen-consistency-check
    :action/notify-coordinator-success       notify-coordinator-success
    :action/persist-result-handles           persist-result-handles
@@ -450,6 +454,64 @@
                        :ceremony/share-handle  share-handle
                        :ceremony/triple-handle triple-handle
                        :ceremony/presig-handle presig-handle}]
+    (run-chart-fsm! orch peers chart-path domain-ctx make-begin build-result
+                    deadline-ms)))
+
+(defn run-share-possession-proof-via-chart
+  "Chart-driven equivalent of ceremony/run-share-possession-proof. Each
+   participating party produces a Schnorr PoK against a verifier-supplied
+   challenge context. With :binding-mode? true, parties also sign the
+   proof bytes with their Ed25519 identity key.
+
+   Challenge-context modes:
+     :challenge-context-hex <hex>
+       Uniform: every party gets the same bytes.
+     :challenge-context-hex-by-role {role <hex>}
+       Per-party: required for identity-share binding proofs.
+
+   On success:
+     {:proofs {role {:verification-share-hex ... :proof-hex ...
+                     :challenge-context-hex ...
+                     :identity-pubkey-hex ... ; binding-mode only
+                     :identity-signature-hex ...}}
+      :ceremony/id <uuid>}"
+  [{:keys [participant-ids identity-pubkeys] :as orch} participants
+   {:keys [share-handle challenge-context-hex challenge-context-hex-by-role
+           binding-mode? deadline-ms chart-path]
+    :or   {deadline-ms 30000
+           chart-path  "../specs/executable/statechart-share-possession-proof.edn"}}]
+  (assert share-handle "run-share-possession-proof-via-chart: :share-handle required")
+  (assert (or challenge-context-hex challenge-context-hex-by-role)
+          "run-share-possession-proof-via-chart: :challenge-context-hex or :challenge-context-hex-by-role required")
+  (let [ceremony-id  (uuidv7/uuidv7)
+        peers        (vec participants)
+        ids          (select-keys participant-ids peers)
+        peer-pubkeys (select-keys identity-pubkeys peers)
+        ctx-for      (fn [me] (or (get challenge-context-hex-by-role me)
+                                  challenge-context-hex))
+        make-begin   (fn [me]
+                       (cond-> {:msg/type                       :ceremony/begin-share-proof
+                                :ceremony/id                    ceremony-id
+                                :ceremony/me                    me
+                                :ceremony/participant-ids       ids
+                                :ceremony/peer-pubkeys          peer-pubkeys
+                                :ceremony/share-handle          share-handle
+                                :ceremony/challenge-context-hex (ctx-for me)}
+                         binding-mode? (assoc :ceremony/binding-mode? true)))
+        build-result (fn [{:ceremony/keys [results]}]
+                       {:proofs (into {}
+                                      (for [[r m] results]
+                                        [r (cond-> {:verification-share-hex (:result/verification-share-hex m)
+                                                    :proof-hex              (:result/proof-hex m)
+                                                    :challenge-context-hex  (ctx-for r)}
+                                             binding-mode?
+                                             (assoc :identity-pubkey-hex    (:result/identity-pubkey-hex m)
+                                                    :identity-signature-hex (:result/identity-signature-hex m)))]))
+                        :ceremony/id ceremony-id})
+        domain-ctx   {:ceremony/id            ceremony-id
+                      :ceremony/participants  peers
+                      :ceremony/share-handle  share-handle
+                      :ceremony/binding-mode? (boolean binding-mode?)}]
     (run-chart-fsm! orch peers chart-path domain-ctx make-begin build-result
                     deadline-ms)))
 

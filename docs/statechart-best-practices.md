@@ -134,6 +134,39 @@ transition that does meaningful work**. If the regions are
 documentation flourish, drop them and track per-party state in
 context.
 
+## 4b. Transport-layer messages count as `:event/protocol-message-emit`
+
+Even ceremonies with no peer-to-peer crypto-protocol exchange (e.g.
+share-possession-proof, where each party computes its proof locally)
+still need an `:event/protocol-message-emit` handler in
+`:state/starting` and `:state/running`. **Reason:** the bb wrapper
+establishes pairwise Noise_KK sessions before computing crypto, and
+the handshake bytes flow through the orchestrator as
+`:protocol/private` messages — which the driver translates to
+`:event/protocol-message-emit` events. If the chart drops these
+handlers, handshake messages hit the FSM with no transition, get
+silently dropped, and the bb wrappers time out waiting on each
+other.
+
+The chart can't tell "crypto bytes" from "Noise handshake bytes"
+apart at the orchestrator layer — they're the same EDN message
+type. So:
+
+```clojure
+:state/starting
+{:on {:event/protocol-message-emit
+      {:target :state/running :actions [:action/route-message]}
+      ;; (other handlers...)}}
+
+:state/running
+{:on {:event/protocol-message-emit
+      {:actions [:action/route-message]}    ; internal — see pattern #2
+      ;; (other handlers...)}}
+```
+
+Even if you "know" the ceremony has no protocol exchange. The
+transport-layer routing is invisible from the chart's perspective.
+
 ## 5. Synthetic events via a pending-events queue
 
 When an action's purpose is to compute a result that triggers the
@@ -237,6 +270,7 @@ ceremony-startup side effects.
 | `:auto :next-state` nested inside `:on` | clj-statecharts ignores it (it expects `:always` at state level) | Translator hoists it; or write `:always` directly |
 | Region states `:done`/`:errored` never reached | Dead structure; chart parses but documents lies | Either give them real transitions or remove the regions |
 | Action checks for a result field the wrapper doesn't send | `:event/finalization-failed` fires unexpectedly | Read what bb actually returns; don't assume |
+| Dropped `:event/protocol-message-emit` handler "because the ceremony has no protocol exchange" | bb wrappers time out during Noise handshake; "EOF during Noise handshake" thrown | Keep the handler — Noise handshake bytes still flow as `:protocol/private` (pattern #4b) |
 
 ## Working examples
 
@@ -254,7 +288,14 @@ rounds, once the patterns from triple-gen were applied.
   - Smoke: `orchestrator/dev/smoke_chart_driven_keygen.clj` —
     chart-driven keygen → procedural triple-gen → presign → sign →
     cross-verify against the chart-driven keygen pubkey
+- `specs/executable/statechart-presign.edn` (2 parties, no check;
+  pattern carried first-attempt)
+  - Smoke: `orchestrator/dev/smoke_chart_driven_presign.clj`
+- `specs/executable/statechart-share-possession-proof.edn` (variable
+  participant set, no peer-to-peer crypto, binding-mode option)
+  - Smoke: `orchestrator/dev/smoke_chart_driven_share_proof.clj` —
+    plain mode + binding mode, both cryptographically verified
 
 Driver: `orchestrator/src/.../chart_driven.clj`. The action
-registry is shared across both ceremonies; per-ceremony differences
+registry is shared across all ceremonies; per-ceremony differences
 live in the entry-point function (`make-begin` and `build-result`).
