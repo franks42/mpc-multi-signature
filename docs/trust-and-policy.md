@@ -515,7 +515,7 @@ Foundational principles section above):*
 **Current:**
 1. Divorce is REPL-callable (`orch/divorce`).
 2. No authorization gate.
-3. Cryptographically, the divorce already works without Figure (run-reshare's protocol-runners = new-participants; Figure is in old-participants but not new, so it isn't contacted).
+3. Cryptographically, the divorce already works without Figure (the reshare ceremony's protocol-runners = new-participants; Figure is in old-participants but not new, so it isn't contacted).
 4. But Figure is required to NOT object — and there's nothing currently stopping Figure from refusing if it had control of the orchestrator (which it does, in production where it plays the coordinator role).
 
 **Gap:**

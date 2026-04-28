@@ -274,20 +274,17 @@ ceremony-startup side effects.
 
 ## Working examples
 
-Two ceremonies are working under the chart-driven driver. The
-patterns generalize: keygen worked on the first attempt, no debugging
-rounds, once the patterns from triple-gen were applied.
+Six ceremonies are working under the chart-driven driver. The
+patterns generalize: every ceremony after the first (triple-gen)
+worked on the first run, except share-possession-proof which
+surfaced the transport-vs-crypto routing gotcha (pattern #4b).
 
-- `specs/executable/statechart-triple-generation.edn` (2 parties,
-  no orchestrator-side consistency check)
-  - Smoke: `orchestrator/dev/smoke_chart_driven.clj` — keygen
-    (procedural) → chart-driven triple-gen → presign → sign →
-    cross-verify
 - `specs/executable/statechart-keygen.edn` (3 parties, real
   consistency check at finalization)
-  - Smoke: `orchestrator/dev/smoke_chart_driven_keygen.clj` —
-    chart-driven keygen → procedural triple-gen → presign → sign →
-    cross-verify against the chart-driven keygen pubkey
+  - Smoke: `orchestrator/dev/smoke_chart_driven_keygen.clj`
+- `specs/executable/statechart-triple-generation.edn` (2 parties,
+  no orchestrator-side consistency check)
+  - Smoke: `orchestrator/dev/smoke_chart_driven.clj`
 - `specs/executable/statechart-presign.edn` (2 parties, no check;
   pattern carried first-attempt)
   - Smoke: `orchestrator/dev/smoke_chart_driven_presign.clj`
@@ -304,6 +301,12 @@ rounds, once the patterns from triple-gen were applied.
   - Smoke: `orchestrator/dev/smoke_chart_driven_reshare.clj` —
     divorce-style membership change; new shareset signs and the
     signature verifies under the ORIGINAL wallet pubkey
+
+Each smoke runner exercises its ceremony end-to-end. Some smokes
+chain other ceremonies as setup (e.g. presign needs keygen +
+triple-gen first); all chained calls go through the chart-driven
+runtime since the public API in `orchestrator.core/...` is wired
+to it.
 
 Driver: `orchestrator/src/.../chart_driven.clj`. The action
 registry is shared across all six ceremonies; per-ceremony

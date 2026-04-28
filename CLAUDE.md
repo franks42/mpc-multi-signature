@@ -39,11 +39,19 @@ These files are the source of truth. When in doubt, they win.
 with namespaced keyword identifiers, role descriptions, and
 cross-references. Read this first.
 
-**`specs/statechart-keygen.edn`**, **`specs/statechart-sign.edn`**,
-**`specs/statechart-reshare-recovery.edn`** — orchestrator-side
-ceremony lifecycles for the three implemented ceremony types. More
-will be added (divorce, refresh, attestation-issuance,
-triple-generation, presign).
+**`specs/statechart-*.edn`** (9 documentation charts) —
+orchestrator-side ceremony lifecycles, written for human readers:
+keygen, sign, reshare-recovery, reshare-divorce, reshare-refresh,
+triple-generation, presign, share-possession-proof,
+attestation-issuance.
+
+**`specs/executable/statechart-*.edn`** (6 executable charts) —
+the charts the runtime literally executes via `clj-statecharts`:
+keygen, triple-generation, presign, share-possession-proof, sign,
+reshare. The reshare chart covers all three reshare flavors
+(recovery, refresh, divorce). The attestation-issuance ceremony
+(TAS-driven, no MPC) does not yet have an executable chart and
+remains future Stage 5c work.
 
 **`docs/recovery-exploration-harness-design.md`** — architectural
 rationale for everything: layer responsibilities, role asymmetry,

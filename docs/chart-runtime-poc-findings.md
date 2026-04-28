@@ -13,18 +13,15 @@ mechanically impossible — the chart **is** the implementation.
 
 ## Outcome — success on the second attempt
 
-Two ceremonies now drive end-to-end through the chart-driven runtime:
-
-- **Triple-generation (2 parties).** Smoke runner
-  `orchestrator/dev/smoke_chart_driven.clj`. Drives keygen
-  (procedural) → chart-driven triple-gen → procedural presign +
-  sign → cross-verify against the wallet pubkey. Green.
-- **Keygen (3 parties, real consistency check).** Smoke runner
-  `orchestrator/dev/smoke_chart_driven_keygen.clj`. Drives
-  chart-driven keygen → procedural triple-gen + presign + sign →
-  cross-verify against the *chart-driven keygen's* reported pubkey.
-  Green. **First-attempt success** once the patterns from the first
-  ceremony were applied.
+Six ceremonies (every threshold-MPC ceremony in the project) now
+drive end-to-end through the chart-driven runtime: keygen,
+triple-generation, presign, sign, reshare (covering recovery,
+refresh, divorce variants), and share-possession-proof. Each has a
+per-ceremony smoke runner under `orchestrator/dev/`. All exercise
+real Noise_KK sessions + crypto-core; final signatures cross-verify
+against the wallet pubkey. After the cleanup commit that redirected
+`orchestrator.core`'s public API to chart-driven entry points, the
+procedural `ceremony.clj` was deleted entirely.
 
 The patterns that made it work — and the ones that broke the first
 attempt — are documented in `docs/statechart-best-practices.md`.
@@ -80,67 +77,50 @@ patterns:
   `::build-result`) so the chart actions stay generic across
   ceremonies.
 
-## Recommendation
+## What was merged
 
-**Merge `feat/chart-runtime-poc` to `main` as the foundation for
-future ceremony work.** Specifically:
-
-- Keep the executable charts under `specs/executable/`
-  (`statechart-keygen.edn`, `statechart-triple-generation.edn`).
-- Keep the chart-driven runtime
-  (`orchestrator/src/.../chart_driven.clj`) and the translator
-  (`orchestrator/src/.../chart_runtime.clj`).
-- Keep both smoke runners
-  (`orchestrator/dev/smoke_chart_driven.clj`,
-  `orchestrator/dev/smoke_chart_driven_keygen.clj`).
-- Keep the conformance tests
-  (`orchestrator/test/.../chart_conformance_test.clj`, 10 tests / 50
-  assertions). These cover the **documentation** charts and provide
-  drift-detection against the procedural runtime; complementary to
-  the executable charts.
-- Keep the patterns doc (`docs/statechart-best-practices.md`).
-
-**Documentation charts stay where they are.** The charts in
-`specs/` were written for human readers and serve that purpose well.
-Trying to make a single chart serve both audiences was the lesson
-of the first attempt; we don't repeat it.
+The `feat/chart-runtime-poc` branch became the foundation for all
+ceremony work. After the migration was complete, the procedural
+`ceremony.clj` was deleted and `orchestrator.core`'s public API was
+redirected to call the chart-driven entry points. The conformance
+tests still cover the **documentation** charts in `specs/` (which
+remain as human-readable references) — they provide drift-detection
+between the documentation chart shapes and the executable chart
+shapes; they have nothing to compare against the procedural runtime
+because the procedural runtime is gone.
 
 ## What the runtime looks like now
 
 ```
-specs/executable/
+specs/executable/                       ← six charts, one per ceremony
 ├── statechart-keygen.edn               ← 3-party DKG, real consistency check
-└── statechart-triple-generation.edn    ← 2-party Beaver triples
+├── statechart-triple-generation.edn    ← 2-party Beaver triples
+├── statechart-presign.edn              ← 2-party presignature
+├── statechart-share-possession-proof.edn ← variable participants, binding-mode option
+├── statechart-sign.edn                 ← asymmetric result (only coordinator signs)
+└── statechart-reshare.edn              ← covers recovery, refresh, divorce
 
 orchestrator/src/.../chart_runtime.clj  ← project-EDN → clj-statecharts spec translator
 orchestrator/src/.../chart_driven.clj   ← generic driver + per-ceremony entry points
-orchestrator/dev/smoke_chart_driven.clj         ← triple-gen end-to-end smoke
-orchestrator/dev/smoke_chart_driven_keygen.clj  ← keygen end-to-end smoke
+orchestrator/dev/smoke_chart_driven*.clj         ← six per-ceremony smoke runners
 orchestrator/test/.../chart_conformance_test.clj ← documentation-chart drift detection
 docs/statechart-best-practices.md       ← patterns doc (read this before the next chart)
 ```
 
+The `orchestrator/src/.../ceremony.clj` (procedural runtime) is
+gone — the chart-driven runtime fully subsumed it.
+
 ## Next ceremonies
 
-The patterns generalize. New ceremonies (sign, presign, reshare-*)
-follow the same shape: write the executable chart in
-`specs/executable/`, supply a `make-begin` and `build-result`, add
+The patterns generalize. New ceremonies (Stage 5c business logic:
+attestation-issuance, etc.) follow the same shape: write the
+executable chart in `specs/executable/`, supply a `make-begin`
+and `build-result`, add
 the chart action registry entries needed by ceremony-specific
 finalization (the way `keygen-consistency-check` was added). The
 generic driver doesn't change.
 
-Order I'd suggest:
-
-1. **Sign** — interesting because the result shape is asymmetric
-   (only the coordinator returns a signature). Tests the "results
-   may have nil-from-some-parties" path through the consistency
-   check.
-2. **Presign** — same shape as triple-gen, sanity-check that the
-   pattern carries.
-3. **Reshare-recovery** — the load-bearing UC2 ceremony. Adds the
-   "old vs new participants" wrinkle (only `new_participants` run
-   the protocol, but `old_participants` are referenced).
-4. **Reshare-refresh / reshare-divorce** — variants of recovery.
-
-Each new ceremony should add a smoke runner that exercises it
-end-to-end against real bb wrappers and crypto-core.
+Each new ceremony should add a smoke runner under
+`orchestrator/dev/smoke_chart_driven_<name>.clj` that exercises it
+end-to-end against real bb wrappers and crypto-core, with a final
+cross-verification step where applicable.
