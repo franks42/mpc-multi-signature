@@ -51,6 +51,12 @@ implementation plan in stages, EDN vocabulary appendix. Appendix E
 and Appendix F (added 2026-04-26) capture Stage 5+ design decisions
 for confidentiality/transport and share-possession proofs.
 
+**`docs/statechart-best-practices.md`** — patterns guide for
+writing executable ceremony charts. Read this before adding a new
+ceremony. The `fsm/assign` gotcha (pattern #1) is the single biggest
+trap; the transport-vs-crypto routing distinction (pattern #4b) is
+the second.
+
 **`docs/mpc-feasibility-spike.md`** — proves cryptographic
 feasibility against NEAR's `threshold-signatures` crate with two
 working tests. The Rust core's API is exercised here; consult before
@@ -109,18 +115,23 @@ the parties per ceremony. The EDN message vocabulary and statecharts
 are designed to span both contexts unchanged; the orchestrator is
 where exploration happens.
 
-**Statecharts as specification.** The chart files are the spec for
-ceremony lifecycle. Whether the runtime literally executes them via
-clj-statecharts or merely conforms to them is a later choice; either
-way the chart is authoritative. When the implementation diverges
-from the chart, fix the chart or fix the code, not both
-independently.
+**Statecharts as implementation.** The chart files in
+`specs/executable/` ARE the implementation — `chart_driven.clj`
+loads them via `clj-statecharts`. Drift is mechanically impossible:
+modifying the chart changes the runtime behavior immediately. The
+documentation charts in `specs/` (without `executable/`) remain as
+human-readable references and are covered by conformance tests.
+When writing a new ceremony, the workflow is "write executable
+chart → add ceremony-specific action(s) → add entry-point function" —
+see `docs/statechart-best-practices.md` (especially the `fsm/assign`
+gotcha in pattern #1).
 
 ## Implementation plan — staged
 
 The plan is in `docs/recovery-exploration-harness-design.md` under
-"Implementation plan". **Stages 0 through 5a are done as of
-2026-04-26**; Stage 5b is next.
+"Implementation plan". **Stages 0 through 5b are done as of
+2026-04-28; the chart-driven runtime foundation (v0.6.0) shipped in
+2026-04-28**. Stage 5c (business logic) is next.
 
 Status at a glance:
 
@@ -153,19 +164,34 @@ Status at a glance:
   Tag `v0.5.0-stage-5a-share-possession-binding`. Concrete signal:
   every party now has a cryptographically welded identity-share
   pairing — the trust foundation for everything downstream.
-- **Stage 5b (next)** — transport hardening (per design doc
-  Appendix E): Noise XK session layer in the bb wrapper using
-  signet 0.5.0's `encryption/box`+`unbox` primitives, AEAD-wrapping
-  protocol_private bodies before they leave the party; plus
-  encryption-at-rest for `<role>/{shares,triples,presigs}/<handle>.bin`
-  files; plus migrating Stage 5a's Ed25519 identity keys from the
-  orchestrator (current harness placement) to the bb wrapper
-  (production placement).
-- **Stage 5c (after)** — traditional business-logic scope:
+- **Stage 5b (done)** — transport hardening (per design doc
+  Appendix E): Noise_KK pairwise sessions in the bb wrapper using
+  the same Ed25519 identity keys provisioned in Stage 5a (auto-
+  converted to X25519 via signet's birational map). AEAD-wrapped
+  protocol bodies. Encryption-at-rest for share/triple/presig files
+  at the bb-wrapper boundary. Identity-key placement migrated from
+  orchestrator to bb wrapper (production placement: orchestrator
+  only sees announced pubkeys). Tag `v0.5b-stage-5b-complete`.
+- **Chart-driven foundation (done 2026-04-28)** — six executable
+  charts in `specs/executable/` drive the entire ceremony lifecycle
+  via `clj-statecharts`. The chart IS the implementation; drift is
+  mechanically impossible. Six per-ceremony smoke runners in
+  `orchestrator/dev/smoke_chart_driven_*.clj` exercise each end-to-
+  end with real Noise sessions + crypto-core; final signatures
+  cross-verify against original wallet pubkeys. Patterns doc:
+  `docs/statechart-best-practices.md`. Tag
+  `v0.6.0-chart-driven-foundation` (initial keygen + triple-gen);
+  presign, share-possession-proof, sign, reshare added in follow-up
+  commits on the same branch. The procedural `ceremony.clj` was
+  fully subsumed and deleted.
+- **Stage 5c (next)** — traditional business-logic scope:
   commitment registries, commitment-gated reshare,
   publication/objection windows, multi-party authorization gates for
   recovery, attestation-issuance ceremonies (KYC TAS, commitment
-  TAS, social recovery TAS).
+  TAS, social recovery TAS). New ceremonies now reduce to writing an
+  executable chart in `specs/executable/` + a thin entry-point
+  function with `make-begin` and `build-result` in
+  `orchestrator/.../chart_driven.clj`.
 
 Stage 5b prerequisites already shipped: **signet 0.5.0** (in `~/.m2`
 + `github.com/franks42/signet` tag `v0.5.0`) provides
@@ -284,26 +310,26 @@ returns a result map after the ceremony completes. Internally use
 core.async or promises; externally keep the call synchronous. Don't
 make REPL users deal with async unless they ask for it.
 
-**Statechart execution.** You have two reasonable choices:
+**Statechart execution.** Decided: **the chart IS the implementation.**
+`orchestrator/.../chart_driven.clj` loads each chart in
+`specs/executable/` via the translator at
+`orchestrator/.../chart_runtime.clj` and feeds the resulting FSM
+(via the `franks42/clj-statecharts-bb-scittle` fork) ceremony events
+from the bb wrappers. Drift between chart and code is mechanically
+impossible because they are the same thing.
 
-1. *Statechart as documentation only.* Implement the orchestrator's
-   ceremony lifecycle as straightforward Clojure code; cite the
-   statechart in code comments; periodically run a structural
-   conformance check (does the code respect the chart's transitions
-   and properties?).
+When writing a new ceremony, follow `docs/statechart-best-practices.md`.
+Pattern #1 is non-obvious and costs hours if missed: every action
+that updates context must be wrapped with `(fsm/assign ...)`; plain
+return values are silently discarded.
 
-2. *Statechart as runtime structure.* Use `clj-statecharts` (or the
-   `franks42/clj-statecharts-bb-scittle` fork) to execute the chart
-   directly, with the orchestrator's actions implemented as Clojure
-   functions that the chart engine calls.
-
-Option 1 is faster to build and easier to debug. Option 2 makes the
-chart genuinely authoritative — the code can't drift from it because
-it *is* the code. For Stage 1 either is fine; for Stage 4 and Stage
-5, option 2 starts paying off because the failure-handling logic
-gets harder to keep correct in handwritten code. **Recommendation:
-start with option 1, switch to option 2 when the procedural code
-starts feeling tangled.**
+For docs-grade reading the original `specs/statechart-*.edn` charts
+remain canonical (more poetry, illustrate parallel regions etc.);
+the executable variants in `specs/executable/` are sparser and
+hew to clj-statecharts execution semantics. Conformance tests
+(`orchestrator/test/.../chart_conformance_test.clj`) cover the
+documentation charts and provide drift-detection between
+documentation and execution-correct shapes.
 
 **Don't yet build:** persistent state across orchestrator restarts,
 multi-ceremony concurrency, real network transport, encryption at
@@ -399,37 +425,16 @@ sessions that produced this design were valuable specifically
 because they distinguished "verified" from "expected" from
 "assumed." Carry that forward.
 
-## Stage 5 entry points
+## Stage 5c entry points
 
-Stages 0–5a are done. The harness runs UC2 end-to-end (keygen →
-reshare with member change → sign with new shareset → independent
-cross-verify via signet/BC against the original public key, ~3.3s
-wall time) and Stage 5a's share-possession + identity-share binding
-proofs are in place — every party has a cryptographically welded
-identity-share pairing, the trust foundation for everything
-downstream. **signet 0.5.0** with the encryption layer is also
-shipped to `~/.m2` + `github.com/franks42/signet`. What's next:
-
-**Stage 5b — transport hardening** (per design doc Appendix E).
-Three sub-pieces:
-
-1. **Noise XK session layer in the bb wrapper.** At ceremony start,
-   peers run an authenticated key exchange using their Stage 5a
-   Ed25519 identity keys cross-converted to X25519 (signet's
-   birational map handles this). Per-message AEAD via
-   `signet.encryption/box` + `unbox` wrapping `protocol_private`
-   bodies before they leave the party; unwrap on receipt. The
-   orchestrator routes opaque AEAD-wrapped bytes; EDN contract
-   unchanged.
-2. **Migrate Stage 5a's Ed25519 identity keys from orchestrator to
-   bb wrapper** (production placement: each party holds its own
-   private key; orchestrator only sees public keys). Implementation:
-   env-var or configure-message at bb-wrapper startup. The
-   cryptographic structure is unchanged from Stage 5a; just plumbing.
-3. **Encryption-at-rest for `<role>/{shares,triples,presigs}/<handle>.bin`**
-   files at the bb-wrapper boundary. `<role, handle>` API stays
-   unchanged; storage backend swap (encrypt with party-local KEK
-   derived from Stage 5a identity keys, or plug in HSM/keyring/TEE).
+Stages 0–5b plus the chart-driven runtime foundation are done. The
+harness runs every ceremony — keygen, triple-gen, presign, sign,
+reshare (recovery/refresh/divorce), share-possession-proof — through
+the chart-driven runtime end-to-end against real Noise_KK sessions
+and the crypto-core, with final signatures cross-verifying against
+original wallet pubkeys. The procedural ceremony.clj is gone;
+`orchestrator/.../chart_driven.clj` plus `specs/executable/` is the
+implementation. **What's next:**
 
 **Stage 5c — business logic.** The traditional Stage 5 scope:
 commitment registries (Figure-side), commitment-gated reshare,
@@ -440,15 +445,33 @@ recovery TAS). Per the design doc: "the architecture's payoff
 arrives — adding policy is bb-side logic, not orchestrator/crypto-
 core changes."
 
+Adding a new ceremony in Stage 5c reduces to:
+
+1. Write the executable chart in `specs/executable/<name>.edn`,
+   following `docs/statechart-best-practices.md` (especially the
+   `fsm/assign` gotcha in pattern #1).
+2. Add ceremony-specific actions to
+   `orchestrator/.../chart_driven.clj` if finalization needs them
+   (most ceremonies reuse the existing actions; add a
+   `<name>-consistency-check` if you have a real check, otherwise
+   alias `:action/<name>-shape-check` to `check-results-collected`).
+3. Add a `run-<name>-via-chart` entry point with `make-begin` and
+   `build-result` closures.
+4. Optionally add a smoke runner in `orchestrator/dev/`.
+
 **Working entry pattern for a fresh session:**
 
 1. Read this file (orientation).
 2. `mcp__memory__memory_search` for tag `mpc-multi-signature,plan`
-   to load the latest plan/status memory; for tag
-   `signet,planned-enhancement` to load the signet roadmap.
-3. Skim `docs/recovery-exploration-harness-design.md` Appendix E + F
-   for the Stage 5+ architecture decisions.
+   for the latest plan/status memory; for tag
+   `mpc-multi-signature,statechart,clj-statecharts,best-practices`
+   for the chart-driven runtime patterns; for tag
+   `signet,planned-enhancement` for the signet roadmap.
+3. Skim `docs/statechart-best-practices.md` if you'll be writing a
+   chart; `docs/recovery-exploration-harness-design.md` Appendix E +
+   F for transport / share-possession architecture.
 4. `git log --oneline -20` for the recent narrative.
-5. Pick a substage (5a / signet 0.5.0 / 5b / 5c) and start.
+5. Pick a Stage 5c sub-piece (commitment registry, commitment-gated
+   reshare, attestation-issuance, etc.) and start.
 
 Good luck. Ask early, test often.
