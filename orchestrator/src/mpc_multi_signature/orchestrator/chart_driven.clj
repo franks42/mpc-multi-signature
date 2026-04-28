@@ -104,6 +104,33 @@
            (if ok? :event/finalization-passed :event/finalization-failed))
     state))
 
+(def ^:private sign-consistency-check
+  "Sign-specific finalization check. The coordinator returns a
+   signature; non-coordinators return nil for the signature field.
+   Verify exactly one party (the named coordinator) returned a non-nil
+   :result/signature-hex; populate :ceremony/signature-hex; queue
+   :event/finalization-passed (or -failed)."
+  (fsm/assign
+   (fn [{:keys [::pending-events :ceremony/coordinator :ceremony/results]
+         :as state} _event]
+     (let [coord-sig    (get-in results [coordinator :result/signature-hex])
+           non-coord-sigs (->> (dissoc results coordinator)
+                               vals
+                               (map :result/signature-hex)
+                               (remove nil?))]
+       (cond
+         (nil? coord-sig)
+         (do (swap! pending-events conj :event/finalization-failed)
+             (assoc state :ceremony/error :reason/no-signature-from-coordinator))
+
+         (seq non-coord-sigs)
+         (do (swap! pending-events conj :event/finalization-failed)
+             (assoc state :ceremony/error :reason/non-coordinator-emitted-signature))
+
+         :else
+         (do (swap! pending-events conj :event/finalization-passed)
+             (assoc state :ceremony/signature-hex coord-sig)))))))
+
 (def ^:private keygen-consistency-check
   "Keygen-specific finalization check. Reads per-party results and
    verifies all parties report the same public-key-hex. On agreement:
@@ -239,6 +266,7 @@
    :action/presig-shape-check               check-results-collected
    :action/share-proof-shape-check          check-results-collected
    :action/keygen-consistency-check         keygen-consistency-check
+   :action/sign-consistency-check           sign-consistency-check
    :action/notify-coordinator-success       notify-coordinator-success
    :action/persist-result-handles           persist-result-handles
    :action/send-cancel-to-all-participants  send-cancel-to-all-participants
@@ -454,6 +482,52 @@
                        :ceremony/share-handle  share-handle
                        :ceremony/triple-handle triple-handle
                        :ceremony/presig-handle presig-handle}]
+    (run-chart-fsm! orch peers chart-path domain-ctx make-begin build-result
+                    deadline-ms)))
+
+(defn run-sign-via-chart
+  "Chart-driven equivalent of ceremony/run-sign. Consumes the keygen
+   share-handle, a presig-handle, and a 32-byte digest-hex; the
+   named coordinator party produces an ECDSA signature. On success:
+     {:signature-hex <r||s in hex>
+      :coordinator <role>
+      :ceremony/id <uuid>}"
+  [{:keys [participant-ids identity-pubkeys] :as orch} participants
+   {:keys [threshold coordinator share-handle presig-handle digest-hex
+           deadline-ms chart-path]
+    :or   {threshold 2
+           deadline-ms 60000
+           chart-path  "../specs/executable/statechart-sign.edn"}}]
+  (assert share-handle  "run-sign-via-chart: :share-handle required")
+  (assert presig-handle "run-sign-via-chart: :presig-handle required")
+  (assert digest-hex    "run-sign-via-chart: :digest-hex required (32-byte hex)")
+  (assert coordinator   "run-sign-via-chart: :coordinator required (role keyword)")
+  (let [ceremony-id  (uuidv7/uuidv7)
+        peers        (vec participants)
+        ids          (select-keys participant-ids peers)
+        peer-pubkeys (select-keys identity-pubkeys peers)
+        make-begin   (fn [me]
+                       {:msg/type                 :ceremony/begin-sign
+                        :ceremony/id              ceremony-id
+                        :ceremony/me              me
+                        :ceremony/peers           peers
+                        :ceremony/participant-ids ids
+                        :ceremony/peer-pubkeys    peer-pubkeys
+                        :ceremony/threshold       threshold
+                        :ceremony/coordinator     coordinator
+                        :ceremony/share-handle    share-handle
+                        :ceremony/presig-handle   presig-handle
+                        :ceremony/digest-hex      digest-hex})
+        build-result (fn [state]
+                       {:signature-hex (:ceremony/signature-hex state)
+                        :coordinator   coordinator
+                        :ceremony/id   ceremony-id})
+        domain-ctx   {:ceremony/id            ceremony-id
+                      :ceremony/participants  peers
+                      :ceremony/coordinator   coordinator
+                      :ceremony/share-handle  share-handle
+                      :ceremony/presig-handle presig-handle
+                      :ceremony/digest-hex    digest-hex}]
     (run-chart-fsm! orch peers chart-path domain-ctx make-begin build-result
                     deadline-ms)))
 

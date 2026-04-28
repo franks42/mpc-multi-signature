@@ -1,0 +1,154 @@
+;; Statechart: Sign ceremony — EXECUTABLE variant
+;;
+;; Companion documentation chart: ../statechart-sign.edn
+;;
+;; Routine sign ceremony: 2 parties (holder + figure), IC offline.
+;; Consumes the keygen share + a presignature; produces a single
+;; ECDSA signature valid under the wallet's public key.
+;;
+;; Sign-specific:
+;;   - Asymmetric result. Only the coordinator (typically figure)
+;;     returns :result/signature-hex; non-coordinator parties return
+;;     nil for that field. The chart's finalization check
+;;     (:action/sign-consistency-check) verifies exactly one party
+;;     returned a signature, populates :ceremony/signature-hex, and
+;;     queues finalization-passed. If zero or >1 signatures, queues
+;;     finalization-failed.
+;;   - The coordinator role is named in the begin-message
+;;     (:ceremony/coordinator) and stays in context for the
+;;     consistency check to look up.
+;;
+;; Documentation chart includes a :state/policy-check between
+;; :state/pending and :state/starting (figure can refuse based on
+;; issuer policy). The current procedural runtime does not implement
+;; the policy gate; this executable chart matches that and may grow
+;; the gate later.
+
+{:statechart/id           :statechart/ceremony-sign-exec
+ :statechart/version      "0.2.0"
+ :statechart/ceremony     :ceremony/sign
+ :statechart/dictionary   "../data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle, executable"
+
+ :statechart/context
+ {:ceremony/id              nil
+  :ceremony/participants    nil
+  :ceremony/coordinator     nil    ; role keyword, e.g. :figure
+  :ceremony/share-handle    nil
+  :ceremony/presig-handle   nil
+  :ceremony/digest-hex      nil
+  :ceremony/signature-hex   nil    ; populated by consistency check on success
+  :ceremony/per-party-state {}
+  :ceremony/results         {}
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  {:on {:event/begin-ceremony
+        {:target  :state/starting
+         :actions [:action/record-handles]}
+
+        :event/cancel
+        {:target  :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target  :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  {:on {:event/protocol-message-emit
+        {:actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:actions [:action/record-party-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}}
+
+  :state/finalizing
+  ;; Sign consistency check: exactly one party (the coordinator) must
+  ;; have returned a signature. Populates :ceremony/signature-hex on
+  ;; success.
+  {:entry [:action/collect-per-party-results
+           :action/sign-consistency-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/complete
+  {:type  :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles]}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type  :final
+   :entry [:action/notify-coordinator-failure]}}
+
+ :statechart/properties
+ [{:property/name :exactly-one-signature
+   :property/check ":action/sign-consistency-check requires exactly
+                    one non-nil :result/signature-hex across parties.
+                    Zero or >1 → :event/finalization-failed."}
+
+  {:property/name :coordinator-named-in-context
+   :property/check ":ceremony/coordinator is required in context for
+                    the consistency check to identify which party's
+                    signature is canonical."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete reachable only from :state/finalizing."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every non-final state has an :event/cancel transition."}]}
