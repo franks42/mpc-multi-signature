@@ -1,7 +1,8 @@
 # Chart-Driven Runtime POC — Findings
 
-> **Branch:** `feat/chart-runtime-poc`. Not merged. This document
-> captures what we learned and the recommended path forward.
+> **Branch:** `feat/chart-runtime-poc`. The POC succeeded on a
+> second-generation approach. This document records what we learned
+> across two attempts and the recommended path forward.
 
 ## Goal
 
@@ -10,186 +11,136 @@ Test whether the orchestrator's ceremony lifecycle could literally
 just conform to them. If so, drift between chart and code becomes
 mechanically impossible — the chart **is** the implementation.
 
-## Outcome — partial success
+## Outcome — success on the second attempt
 
-**What works:**
+Two ceremonies now drive end-to-end through the chart-driven runtime:
 
-1. **Translator** (`orchestrator/src/.../chart_runtime.clj`,
-   ~250 LOC) reads our project chart EDN — with our project
-   conventions (`:statechart/states`, `:statechart/parallel-regions`,
-   `:action/X` keywords, `(guard/X args)` lists, `:auto` eventless
-   transitions) — and produces a value that
-   `clj-statecharts.core/machine` accepts. Three iterations
-   surfaced real bugs:
-   - `:guards` (vector form) wasn't being resolved into
-     clj-statecharts's `:guard` (single predicate).
-   - `:auto` was being placed inside `:on` instead of hoisted to
-     state-level `:always`.
-   - Per-region inner states use plain `:states` (not
-     `:statechart/states`); the recursion needed to accept both.
+- **Triple-generation (2 parties).** Smoke runner
+  `orchestrator/dev/smoke_chart_driven.clj`. Drives keygen
+  (procedural) → chart-driven triple-gen → procedural presign +
+  sign → cross-verify against the wallet pubkey. Green.
+- **Keygen (3 parties, real consistency check).** Smoke runner
+  `orchestrator/dev/smoke_chart_driven_keygen.clj`. Drives
+  chart-driven keygen → procedural triple-gen + presign + sign →
+  cross-verify against the *chart-driven keygen's* reported pubkey.
+  Green. **First-attempt success** once the patterns from the first
+  ceremony were applied.
 
-2. **Conformance tests**
-   (`orchestrator/test/.../chart_conformance_test.clj`,
-   10 tests / 50 assertions, all passing). Each chart driven
-   through its expected event sequence with stub action/guard
-   registries; reaches the expected terminal state and fires the
-   expected actions. Catches drift between chart and procedural
-   reality at the structural level — every transition exercised
-   by a test cannot diverge silently.
+The patterns that made it work — and the ones that broke the first
+attempt — are documented in `docs/statechart-best-practices.md`.
 
-3. **Action/guard registry + chart-driven driver**
-   (`orchestrator/src/.../chart_driven_ceremonies.clj`,
-   ~400 LOC) implements `run-triple-generation-via-chart` against
-   the existing party-connection plumbing.
+## What the first attempt taught us
 
-**What did not work** (under real ceremony execution):
+The initial attempt tried to drive the *documentation* charts
+(`specs/statechart-*.edn`) directly via clj-statecharts. The
+translator (`orchestrator/src/.../chart_runtime.clj`) was correct,
+but the charts contained idioms that read naturally as English yet
+fail under clj-statecharts execution semantics:
 
-The chart-driven driver, when wired against bb wrappers running
-real Noise sessions and crypto-core processes, surfaced multiple
-structural mismatches between the *human-readable* chart and what
-clj-statecharts requires for *correct execution*. Each fix
-exposed the next:
+1. **Self-loops on parallel parents** (`:state/running →
+   :state/running` on every protocol message). External transitions
+   exit and re-enter the state, resetting parallel regions to their
+   initial substate.
+2. **Per-region entry actions duplicating parent's transition
+   actions.** Both fired, leading to double-routing of protocol
+   messages and AEAD-tag failures from Noise nonce desync.
+3. **Dead `:done`/`:errored` sub-states** that no transition ever
+   reached — readable as documentation, structural noise to an
+   executor.
+4. **Notation mismatch between charts and runtime.** Charts used
+   `:actor/holder`; runtime used `:holder`. Required a bridge.
+5. **Silent context-update discard.** Actions returning a modified
+   state map have their changes ignored unless the return value is
+   wrapped in `(fsm/assign ...)` — the killer gotcha that costs
+   hours.
 
-1. **Double-firing of `:action/route-message`.** The chart's
-   `:state/running` parent has `:on {:event/protocol-message-emit
-   {:target :state/running :actions [:action/route-message]}}`
-   AND each region's `:party-state/relaying` has
-   `:entry [:action/route-message]`. clj-statecharts (correctly
-   per XState semantics) fires both — the parent's transition
-   action AND the region's entry action. Result: each protocol
-   message routed twice, breaking the recipient's Noise nonce
-   sequence on the second decryption attempt with
-   `AEADBadTagException`.
+The first-attempt artifacts (`chart_driven_ceremonies.clj`,
+`smoke_chart_driven.clj` in their pre-rename form) have been
+removed; the lessons distilled to the patterns doc.
 
-2. **Self-loop on parallel parent state conflicts with region
-   transitions.** The parent's `:target :state/running` (self-loop
-   when receiving `:event/protocol-message-emit` while already in
-   `:state/running`) is an *external* transition: clj-statecharts
-   exits the parent state and re-enters, which resets each region
-   to its initial sub-state. Meanwhile the region's transition
-   wants to move from `:awaiting` to `:relaying`. clj-statecharts
-   detects the conflicting configuration and asserts:
-   `invalid paths: [(:party-state/awaiting) (:party-state/relaying)]`.
-   The fix would be either an *internal* transition (no `:target`)
-   at the parent level, or removing the parent's `:on` entry
-   entirely and letting the regions handle routing.
+## What the second attempt did differently
 
-3. **Notation mismatch between charts and runtime.** Charts use
-   namespaced actor keywords (`:actor/holder`,
-   `:actor/independent-custodian`); the runtime uses bare role
-   keywords (`:holder`, `:ic`). This needed a
-   `actor->bare-role` bridge. The "two notational forms" pattern
-   is documented in `specs/data-dictionary.edn`; what's not
-   documented is that running a chart *executably* requires a
-   bridge between them — every keyword that crosses the
-   chart/runtime boundary needs translation.
+Designed *new* charts for execution, in `specs/executable/`. The
+patterns:
 
-4. **Per-region transient states `:party-state/done` and
-   `:party-state/errored`** are defined in the charts but no
-   transition ever moves a region into them. Procedural code
-   tracks "done" via context, not via region sub-state.
-   Functionally these are dead states — they document intent
-   but aren't exercised. A chart-driven runtime trips over this:
-   the region's `:on` only handles `:event/protocol-message-emit`,
-   so no region-level state change happens on
-   `:event/ceremony-complete` (which the parent handles).
-
-After three rounds of attempted chart fixes, the smoke runner
-reached the point where bb wrappers actually completed
-`triple-gen` cryptographically — the route-message double-fire
-was eliminated, ceremony_complete events arrived — but the FSM
-event loop did not terminate cleanly within the test timeout.
-At that point, further iteration would have meant continuing to
-debug clj-statecharts execution semantics inside the chart
-abstraction, which (per the user's observation that prompted the
-stop) is exactly what a chart-first design would have avoided.
-
-## What this confirms
-
-**The user's framing was correct:** *"It's much easier to start the
-implementation based on a statechart-machine than to retrofit it
-later."*
-
-The existing charts were written by humans, for humans, with
-documentation as the primary purpose. They contain idioms that
-read naturally as English:
-
-- "Transient `:relaying` state, immediately back to `:awaiting`
-  after action."
-- "Stay in `:running`, route the message."
-- ":party-state/done — terminal substate within :running."
-
-Each of these is structurally subtly wrong as an executable
-specification:
-
-- Self-transitions that imply "stay" need to be either *internal*
-  (no `:target`) or absent (let the parent handle).
-- Eventless transitions in parallel regions need careful state-
-  level placement, not nested in `:on`.
-- "Terminal substates" not reached by any transition are dead
-  decoration that an executor stumbles on.
-
-A chart designed *to be executed* would have caught all of these
-at design time because each one would have prevented the very
-first run from succeeding. Designed for documentation, they read
-fine.
+- No parallel regions when they have no transitions to reach
+  (`:done`/`:errored` decoration in the documentation charts is
+  decoration). Per-party state lives in
+  `:ceremony/per-party-state` context.
+- Internal transitions (no `:target`) for in-state events that
+  don't change state. Confirmed by clj-statecharts source: nil
+  `:target` skips entry/exit and parallel resets.
+- Bare keyword namespace at the chart/runtime boundary. No bridge.
+- All context-updating actions wrapped in `(fsm/assign ...)`. Pure
+  side-effect actions return state unchanged.
+- Synthetic events via a pending-events atom queue, drained by the
+  driver between FSM transitions.
+- Ceremony-specific behavior (begin-message shape, success-result
+  shape) injected as functions in plumbing context (`::make-begin`,
+  `::build-result`) so the chart actions stay generic across
+  ceremonies.
 
 ## Recommendation
 
-**Merge the conformance test approach to `main`, not the chart-
-driven runtime.** Specifically:
+**Merge `feat/chart-runtime-poc` to `main` as the foundation for
+future ceremony work.** Specifically:
 
-- Keep `chart_runtime.clj` (the translator). Real bugs were
-  found and fixed; it works correctly within its scope.
-- Keep `chart_conformance_test.clj` (10 tests / 50 assertions).
-  This is the meaningful drift-detection foundation. Every chart
-  transition exercised by a test cannot drift silently from
-  procedural reality. Stage 5c additions can be charted first,
-  conformance-tested, then implemented procedurally.
-- **Drop `chart_driven_ceremonies.clj`** (the partial runtime).
-  Don't carry POC code in `main`. The lessons from it inform
-  future chart-design choices but the artifact itself is not
-  load-bearing.
-- **Don't modify the charts to be execution-correct.** They are
-  fine as documentation. If at some future point a chart-first
-  redesign is undertaken, it should start fresh — designing
-  charts with execution semantics in mind from the beginning,
-  rather than retrofitting human-readable charts.
+- Keep the executable charts under `specs/executable/`
+  (`statechart-keygen.edn`, `statechart-triple-generation.edn`).
+- Keep the chart-driven runtime
+  (`orchestrator/src/.../chart_driven.clj`) and the translator
+  (`orchestrator/src/.../chart_runtime.clj`).
+- Keep both smoke runners
+  (`orchestrator/dev/smoke_chart_driven.clj`,
+  `orchestrator/dev/smoke_chart_driven_keygen.clj`).
+- Keep the conformance tests
+  (`orchestrator/test/.../chart_conformance_test.clj`, 10 tests / 50
+  assertions). These cover the **documentation** charts and provide
+  drift-detection against the procedural runtime; complementary to
+  the executable charts.
+- Keep the patterns doc (`docs/statechart-best-practices.md`).
 
-## What a chart-first redesign would look like (if pursued later)
+**Documentation charts stay where they are.** The charts in
+`specs/` were written for human readers and serve that purpose well.
+Trying to make a single chart serve both audiences was the lesson
+of the first attempt; we don't repeat it.
 
-For a future iteration where the chart literally drives the
-implementation:
+## What the runtime looks like now
 
-- **No external self-loops on parallel parent states.** Either
-  internal transitions (action-only, no `:target`) or events
-  handled exclusively by regions.
-- **Parallel regions have a real role, not a documentation
-  flourish.** Either every region tracks meaningful per-party
-  state (and there are real transitions to `:done`/`:errored`)
-  or no parallel regions at all (just track per-party state in
-  context).
-- **One namespace for actor keywords.** Either the chart uses
-  bare roles (`:holder`) and the runtime maps them when emitting
-  to the wire, OR the chart uses namespaced (`:actor/holder`)
-  and the runtime normalizes incoming events. Pick one and
-  enforce it.
-- **Test the chart end-to-end as a unit before wiring it to
-  real plumbing.** A chart that drives a fake-peer simulator
-  and reaches `:state/complete` is much easier to debug than
-  one that fails opaquely after passing through bb wrappers,
-  Noise sessions, crypto-core processes, and back.
-- **Chart conformance is a property of the *executable*
-  chart**, not a separate exercise. If the chart is the
-  implementation, conformance is tautological.
+```
+specs/executable/
+├── statechart-keygen.edn               ← 3-party DKG, real consistency check
+└── statechart-triple-generation.edn    ← 2-party Beaver triples
 
-## Files to keep / drop
+orchestrator/src/.../chart_runtime.clj  ← project-EDN → clj-statecharts spec translator
+orchestrator/src/.../chart_driven.clj   ← generic driver + per-ceremony entry points
+orchestrator/dev/smoke_chart_driven.clj         ← triple-gen end-to-end smoke
+orchestrator/dev/smoke_chart_driven_keygen.clj  ← keygen end-to-end smoke
+orchestrator/test/.../chart_conformance_test.clj ← documentation-chart drift detection
+docs/statechart-best-practices.md       ← patterns doc (read this before the next chart)
+```
 
-If merging the conformance tests to `main`:
+## Next ceremonies
 
-- ✅ `orchestrator/src/.../chart_runtime.clj` (translator)
-- ✅ `orchestrator/test/.../chart_conformance_test.clj` (10 tests)
-- ✅ `bb.edn` and `orchestrator/deps.edn` clj-statecharts addition
-- ✅ This findings doc
-- ❌ `orchestrator/src/.../chart_driven_ceremonies.clj` (drop)
-- ❌ `orchestrator/dev/smoke_chart_driven.clj` (drop)
+The patterns generalize. New ceremonies (sign, presign, reshare-*)
+follow the same shape: write the executable chart in
+`specs/executable/`, supply a `make-begin` and `build-result`, add
+the chart action registry entries needed by ceremony-specific
+finalization (the way `keygen-consistency-check` was added). The
+generic driver doesn't change.
+
+Order I'd suggest:
+
+1. **Sign** — interesting because the result shape is asymmetric
+   (only the coordinator returns a signature). Tests the "results
+   may have nil-from-some-parties" path through the consistency
+   check.
+2. **Presign** — same shape as triple-gen, sanity-check that the
+   pattern carries.
+3. **Reshare-recovery** — the load-bearing UC2 ceremony. Adds the
+   "old vs new participants" wrinkle (only `new_participants` run
+   the protocol, but `old_participants` are referenced).
+4. **Reshare-refresh / reshare-divorce** — variants of recovery.
+
+Each new ceremony should add a smoke runner that exercises it
+end-to-end against real bb wrappers and crypto-core.

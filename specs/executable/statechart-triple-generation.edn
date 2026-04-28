@@ -1,0 +1,182 @@
+;; Statechart: Triple-generation ceremony — EXECUTABLE variant
+;;
+;; This chart is designed to be literally executed by clj-statecharts.
+;; It is the *foundation* candidate from the chart-runtime POC: if the
+;; chart-driven runtime works cleanly here, the same execution-correct
+;; patterns can be applied to the rest of the ceremony suite.
+;;
+;; Companion (documentation) chart:
+;;   ../statechart-triple-generation.edn
+;;
+;; Differences from the documentation chart, and *why*:
+;;
+;;   1. NO parallel regions. The documentation chart has per-party
+;;      sub-regions but no transitions ever reach :party-state/done
+;;      or :errored — the regions are dead structure that exists for
+;;      readability. Per-party state lives in
+;;      :ceremony/per-party-state context (already canonical in the
+;;      procedural runtime). One source of truth.
+;;
+;;   2. INTERNAL transitions on :state/running for :event/protocol-
+;;      message-emit (no :target, just :actions). clj-statecharts
+;;      treats nil-target transitions as internal self-transitions
+;;      that DO NOT fire entry/exit actions. This eliminates the
+;;      external-self-loop double-fire and parallel-region reset
+;;      issues we hit in the documentation-chart-driven attempt.
+;;
+;;   3. BARE actor keywords (:holder, :figure, :ic) — no :actor/*
+;;      namespace. The chart and the runtime share one keyword
+;;      namespace at this boundary. Stage 5+ ceremonies should
+;;      pick *one* convention and stick to it; we pick bare here
+;;      because every other layer of the project (orchestrator,
+;;      bb wrapper, runtime registries) uses bare.
+;;
+;; Lessons captured in docs/chart-runtime-poc-findings.md.
+
+{:statechart/id           :statechart/ceremony-triple-generation-exec
+ :statechart/version      "0.2.0"
+ :statechart/ceremony     :ceremony/triple-generation
+ :statechart/dictionary   "../data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle, executable"
+
+ :statechart/context
+ ;; Initial context shape. The driver supplies real values (ceremony id,
+ ;; triple handle, participant set) at FSM init time; this map exists to
+ ;; document the shape and provide defaults.
+ {:ceremony/id              nil
+  :ceremony/participants    nil  ; vector of bare role keywords
+  :ceremony/share-handle    nil  ; input
+  :ceremony/triple-handle   nil  ; output
+  :ceremony/per-party-state {}   ; role → :party-state/awaiting | :done
+  :ceremony/results         {}   ; role → result map (echoed triple-handle, etc.)
+  :ceremony/error           nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  ;; Awaiting begin-ceremony from the caller.
+  {:on {:event/begin-ceremony
+        {:target  :state/starting
+         :actions [:action/record-handles]}
+
+        :event/cancel
+        {:target  :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  ;; Send begin-triples to all participants; arm deadline.
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target  :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Routing phase. Internal transitions (no :target) on
+  ;; :event/protocol-message-emit and on the not-yet-done branch of
+  ;; :event/ceremony-complete — they update context but do not exit
+  ;; or re-enter :state/running.
+  {:on {:event/protocol-message-emit
+        {:actions [:action/route-message]}
+
+        :event/ceremony-complete
+        ;; Vector of guarded transitions evaluated in order; first
+        ;; matching guard wins. Last party's complete advances to
+        ;; :state/finalizing; earlier ones are internal.
+        [{:actions [:action/record-party-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}}
+
+  :state/finalizing
+  ;; Triple-gen has no orchestrator-side cross-party consistency check
+  ;; (the protocol's VSS handles correctness). The shape check confirms
+  ;; every participant returned a result echoing the triple-handle, then
+  ;; queues :event/finalization-passed (or -failed) on the pending-events
+  ;; queue, which the driver's drain loop picks up.
+  {:entry [:action/collect-per-party-results
+           :action/triple-shape-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/complete
+  {:type  :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles]}
+
+  :state/aborting
+  ;; Send cancel to all parties; queue an internal abort-timeout event
+  ;; that the next drain pass picks up. We do not wait for explicit
+  ;; cancel acks in this harness.
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type  :final
+   :entry [:action/notify-coordinator-failure]}}
+
+ :statechart/properties
+ [{:property/name :complete-only-via-finalizing
+   :property/check ":state/complete must be reachable only from
+                    :state/finalizing — no path bypasses the shape
+                    check."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check ":state/failed reachable only from :state/pending
+                    (early cancel) or :state/aborting (post-cancel
+                    cleanup). No direct running→failed path bypasses
+                    the cancel broadcast."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states whose :type is
+                    not :final has an :event/cancel transition."}
+
+  {:property/name :no-double-route-message
+   :property/check ":action/route-message has exactly one home —
+                    :state/running's internal transition on
+                    :event/protocol-message-emit. No parallel regions
+                    duplicate this action."}]}

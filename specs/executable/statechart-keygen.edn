@@ -1,0 +1,157 @@
+;; Statechart: Keygen ceremony — EXECUTABLE variant
+;;
+;; Companion documentation chart: ../statechart-keygen.edn
+;;
+;; Same execution-correct patterns as the triple-generation
+;; executable chart (no parallel regions, internal transitions for
+;; in-state events, bare keywords). See docs/statechart-best-practices.md
+;; and ../executable/statechart-triple-generation.edn for the
+;; reference companion.
+;;
+;; Keygen-specific differences from triple-gen:
+;;
+;;   - 3 parties (holder + figure + IC), not 2.
+;;   - Real consistency check at finalization: every party's reported
+;;     public-key must agree (otherwise the resulting shareset is
+;;     unusable). The :action/keygen-consistency-check action reads
+;;     per-party results, asserts agreement, populates the
+;;     :ceremony/public-key + :ceremony/verification-shares context
+;;     fields, and queues :event/finalization-passed (or -failed).
+;;   - Begin-message kind is :ceremony/begin-keygen.
+
+{:statechart/id           :statechart/ceremony-keygen-exec
+ :statechart/version      "0.2.0"
+ :statechart/ceremony     :ceremony/keygen
+ :statechart/dictionary   "../data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle, executable"
+
+ :statechart/context
+ {:ceremony/id                  nil
+  :ceremony/participants        nil   ; vector of bare role keywords
+  :ceremony/threshold           nil
+  :ceremony/share-handle        nil   ; output (allocated by orchestrator up front)
+  :ceremony/public-key          nil   ; populated by consistency check on success
+  :ceremony/verification-shares nil   ; populated by consistency check on success
+  :ceremony/per-party-state     {}    ; role → :party-state/awaiting | :done
+  :ceremony/results             {}    ; role → result map (with :result/public-key-hex)
+  :ceremony/error               nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  {:on {:event/begin-ceremony
+        {:target  :state/starting
+         :actions [:action/record-handles]}
+
+        :event/cancel
+        {:target  :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target  :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  ;; Internal transitions on in-state events; vector-of-guarded
+  ;; transitions on :event/ceremony-complete to discriminate
+  ;; "stay" vs "advance to finalizing".
+  {:on {:event/protocol-message-emit
+        {:actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:actions [:action/record-party-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}}
+
+  :state/finalizing
+  ;; Real keygen-specific consistency check: all parties must report
+  ;; the same public-key-hex. The action populates
+  ;; :ceremony/public-key + :ceremony/verification-shares on success,
+  ;; or :ceremony/error on disagreement, then queues the appropriate
+  ;; finalization event.
+  {:entry [:action/collect-per-party-results
+           :action/keygen-consistency-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/complete
+  {:type  :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles]}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type  :final
+   :entry [:action/notify-coordinator-failure]}}
+
+ :statechart/properties
+ [{:property/name :complete-only-via-finalizing
+   :property/check ":state/complete reachable only from
+                    :state/finalizing's :event/finalization-passed —
+                    no path bypasses the consistency check."}
+
+  {:property/name :public-key-agreement-mandatory
+   :property/check "All :result/public-key-hex values across parties
+                    must be equal for :event/finalization-passed to
+                    fire. Disagreement → :event/finalization-failed →
+                    :state/aborting → :state/failed."}
+
+  {:property/name :failed-only-via-aborting
+   :property/check ":state/failed reachable only from :state/pending
+                    (early cancel) or :state/aborting (post-cancel
+                    cleanup)."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every state in :statechart/states whose :type is
+                    not :final has an :event/cancel transition."}]}

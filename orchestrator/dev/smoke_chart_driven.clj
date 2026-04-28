@@ -1,14 +1,15 @@
 (ns smoke-chart-driven
-  "Smoke runner: drive triple-generation through both the procedural
-   path (orchestrator.core/triple-generation) and the chart-driven path
-   (chart-driven-ceremonies/run-triple-generation-via-chart) on the
-   same wallet setup. Verify both produce equivalent results and that
-   subsequent presign + sign succeed using the chart-driven triple's
-   handle.
+  "Smoke runner for the chart-driven runtime.
+
+   Drives triple-generation through chart_driven (which targets the
+   executable chart at specs/executable/statechart-triple-generation.edn)
+   and verifies the chart-driven triple-handle is consumable by subsequent
+   presign + sign — i.e. the chart-driven path produces a real,
+   protocol-correct triple, not a structural artifact.
 
    Run from the orchestrator/ directory:
      clojure -M:dev -m smoke-chart-driven"
-  (:require [mpc-multi-signature.orchestrator.chart-driven-ceremonies :as cdc]
+  (:require [mpc-multi-signature.orchestrator.chart-driven :as cd]
             [mpc-multi-signature.orchestrator.core :as orch]))
 
 (defn -main [& _]
@@ -17,34 +18,27 @@
                    {:identity-pubkeys (:identity-pubkeys o)
                     :participant-ids  (:participant-ids o)})
 
-        ;; --- 1. keygen (procedural) ---
+        ;; 1. keygen (procedural) so we have a share-handle to feed
+        ;; the triple-gen ceremony.
         kg (orch/keygen o [:holder :figure :ic] {:threshold 2})
         _  (assert (:share-handle kg) (str "keygen failed: " kg))
         share-handle (:share-handle kg)
         original-pk  (:public-key kg)
         _ (println "keygen done: pk=" (subs original-pk 0 12) "...")
 
-        ;; --- 2a. triple-generation via PROCEDURAL path ---
-        triple-proc (orch/triple-generation o [:holder :figure]
-                                            {:share-handle share-handle})
-        _ (assert (:triple-handle triple-proc)
-                  (str "procedural triple-generation failed: " triple-proc))
-        _ (println "procedural triple-gen done: triple-handle="
-                   (:triple-handle triple-proc))
-
-        ;; --- 2b. triple-generation via CHART-DRIVEN path ---
-        triple-chart (cdc/run-triple-generation-via-chart
-                      o [:holder :figure]
-                      {:share-handle share-handle})
-        _ (assert (:triple-handle triple-chart)
-                  (str "chart-driven triple-generation failed: " triple-chart))
+        ;; 2. triple-generation via chart-driven.
+        triple (cd/run-triple-generation-via-chart
+                o [:holder :figure]
+                {:share-handle share-handle})
+        _ (assert (:triple-handle triple)
+                  (str "chart-driven triple-generation failed: " triple))
         _ (println "chart-driven triple-gen done: triple-handle="
-                   (:triple-handle triple-chart))
+                   (:triple-handle triple))
 
-        ;; --- 3. exercise the chart-driven triple via presign + sign ---
+        ;; 3. exercise the chart-driven triple via presign + sign.
         presig (orch/presign o [:holder :figure]
                              {:share-handle  share-handle
-                              :triple-handle (:triple-handle triple-chart)})
+                              :triple-handle (:triple-handle triple)})
         _ (assert (:presig-handle presig)
                   (str "presign on chart-driven triple failed: " presig))
 
@@ -62,13 +56,11 @@
                   "signature-from-chart-driven-triple did not verify against original pubkey")]
     (println)
     (println "smoke OK")
-    (println "  procedural triple   :" (:triple-handle triple-proc))
-    (println "  chart-driven triple :" (:triple-handle triple-chart))
-    (println "  presign on chart-triple :" (:presig-handle presig))
-    (println "  sign cross-verified :" verified?)
-    (println "  → chart-driven triple-generation produces a valid")
-    (println "    triple that subsequent presign + sign can consume")
-    (println "    to produce a signature verifiable under the original")
-    (println "    wallet public key.")
+    (println "  chart-driven triple :" (:triple-handle triple))
+    (println "  presign on triple      :" (:presig-handle presig))
+    (println "  sign cross-verified    :" verified?)
+    (println "  → executable chart drives a real triple-gen ceremony")
+    (println "    end-to-end, producing a signature that verifies")
+    (println "    under the original wallet public key.")
     (orch/stop-orchestrator o)
     (System/exit 0)))
