@@ -1,0 +1,160 @@
+;; Statechart: Reshare ceremony — EXECUTABLE variant
+;;
+;; Companion documentation charts:
+;;   ../statechart-reshare-recovery.edn
+;;   ../statechart-reshare-refresh.edn
+;;   ../statechart-reshare-divorce.edn
+;;
+;; One chart covers all three reshare flavors. The variants differ in
+;; what their *make-begin* function emits (begin-reshare payload's
+;; old-peers vs new-peers list) — the chart itself is identical:
+;;
+;;   - Recovery (UC2):  old-peers ≠ new-peers (lost holder replaced)
+;;   - Refresh:         old-peers == new-peers (fresh polynomial)
+;;   - Divorce:         old-peers ≠ new-peers (member removed)
+;;
+;; Reshare-specific:
+;;
+;;   - Only new-participants run the protocol (per cait-sith).
+;;     Old-only participants are referenced via begin-message
+;;     metadata but don't exchange protocol messages and don't appear
+;;     as :ceremony/participants in this chart's context.
+;;
+;;   - Public-key preservation (the load-bearing UC2 invariant). The
+;;     consistency check verifies every new participant reports the
+;;     SAME public key AND that public key equals the
+;;     :ceremony/expected-public-key-hex passed in at begin time.
+;;     Disagreement → :event/finalization-failed →
+;;     :state/aborting → :state/failed.
+
+{:statechart/id           :statechart/ceremony-reshare-exec
+ :statechart/version      "0.2.0"
+ :statechart/ceremony     :ceremony/reshare
+ :statechart/dictionary   "../data-dictionary.edn"
+ :statechart/scope        "Orchestrator-side per-ceremony lifecycle, executable"
+
+ :statechart/context
+ {:ceremony/id                       nil
+  :ceremony/participants             nil   ; new-participants (protocol runners)
+  :ceremony/expected-public-key-hex  nil   ; continuity anchor
+  :ceremony/old-share-handle         nil
+  :ceremony/new-share-handle         nil
+  :ceremony/public-key               nil   ; populated by check on success (== expected)
+  :ceremony/verification-shares      nil   ; per-party, populated by check on success
+  :ceremony/per-party-state          {}
+  :ceremony/results                  {}
+  :ceremony/error                    nil}
+
+ :statechart/initial :state/pending
+
+ :statechart/states
+ {:state/pending
+  {:on {:event/begin-ceremony
+        {:target  :state/starting
+         :actions [:action/record-handles]}
+
+        :event/cancel
+        {:target  :state/failed
+         :actions [:action/record-cancel-reason]}}}
+
+  :state/starting
+  {:entry [:action/send-begin-to-all-participants
+           :action/start-deadline-timer]
+   :on   {:event/protocol-message-emit
+          {:target  :state/running
+           :actions [:action/route-message]}
+
+          :event/ceremony-error
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/running
+  {:on {:event/protocol-message-emit
+        {:actions [:action/route-message]}
+
+        :event/ceremony-complete
+        [{:actions [:action/record-party-done]
+          :guards  [(guard/at-least-one-party-still-running)]}
+         {:target  :state/finalizing
+          :actions [:action/record-party-done]
+          :guards  [(guard/all-parties-done-after-this-event)]}]
+
+        :event/ceremony-error
+        {:target  :state/aborting
+         :actions [:action/record-error
+                   :action/record-erroring-party]}
+
+        :event/cancel
+        {:target  :state/aborting
+         :actions [:action/record-cancel-reason]}
+
+        :event/deadline-elapsed
+        {:target  :state/aborting
+         :actions [:action/record-timeout]}}}
+
+  :state/finalizing
+  ;; Public-key preservation check. Populates :ceremony/public-key +
+  ;; :ceremony/verification-shares on success.
+  {:entry [:action/collect-per-party-results
+           :action/reshare-consistency-check]
+   :on   {:event/finalization-passed
+          {:target :state/complete}
+
+          :event/finalization-failed
+          {:target  :state/aborting
+           :actions [:action/record-error]}
+
+          :event/cancel
+          {:target  :state/aborting
+           :actions [:action/record-cancel-reason]}
+
+          :event/deadline-elapsed
+          {:target  :state/aborting
+           :actions [:action/record-timeout]}}}
+
+  :state/complete
+  {:type  :final
+   :entry [:action/notify-coordinator-success
+           :action/persist-result-handles]}
+
+  :state/aborting
+  {:entry [:action/send-cancel-to-all-participants
+           :action/start-abort-timeout]
+   :on   {:event/all-parties-acked-cancel
+          {:target :state/failed}
+
+          :event/abort-timeout-elapsed
+          {:target :state/failed}}}
+
+  :state/failed
+  {:type  :final
+   :entry [:action/notify-coordinator-failure]}}
+
+ :statechart/properties
+ [{:property/name :public-key-preservation-mandatory
+   :property/check ":state/complete reachable only via
+                    :state/finalizing's :event/finalization-passed,
+                    which fires only if every new participant's
+                    reported public-key matches
+                    :ceremony/expected-public-key-hex."}
+
+  {:property/name :only-new-participants-run-protocol
+   :property/check ":ceremony/participants in this chart is the
+                    set of new-participants only (per cait-sith).
+                    Old-only participants are referenced via
+                    begin-message metadata but don't exchange
+                    protocol messages."}
+
+  {:property/name :complete-only-via-finalizing
+   :property/check ":state/complete reachable only from :state/finalizing."}
+
+  {:property/name :every-non-final-state-handles-cancel
+   :property/check "Every non-final state has an :event/cancel transition."}]}

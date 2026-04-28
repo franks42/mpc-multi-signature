@@ -295,7 +295,17 @@ rounds, once the patterns from triple-gen were applied.
   participant set, no peer-to-peer crypto, binding-mode option)
   - Smoke: `orchestrator/dev/smoke_chart_driven_share_proof.clj` —
     plain mode + binding mode, both cryptographically verified
+- `specs/executable/statechart-sign.edn` (asymmetric result; only
+  coordinator returns signature)
+  - Smoke: `orchestrator/dev/smoke_chart_driven_sign.clj`
+- `specs/executable/statechart-reshare.edn` (covers recovery,
+  refresh, divorce; old vs new participant sets; load-bearing UC2
+  public-key preservation invariant)
+  - Smoke: `orchestrator/dev/smoke_chart_driven_reshare.clj` —
+    divorce-style membership change; new shareset signs and the
+    signature verifies under the ORIGINAL wallet pubkey
 
 Driver: `orchestrator/src/.../chart_driven.clj`. The action
-registry is shared across all ceremonies; per-ceremony differences
-live in the entry-point function (`make-begin` and `build-result`).
+registry is shared across all six ceremonies; per-ceremony
+differences live in the entry-point function (`make-begin` and
+`build-result`).

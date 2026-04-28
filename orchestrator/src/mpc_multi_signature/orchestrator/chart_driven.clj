@@ -131,6 +131,36 @@
          (do (swap! pending-events conj :event/finalization-passed)
              (assoc state :ceremony/signature-hex coord-sig)))))))
 
+(def ^:private reshare-consistency-check
+  "Reshare-specific finalization check. Every new participant must
+   report the SAME public-key-hex AND it must equal
+   :ceremony/expected-public-key-hex (continuity anchor passed in at
+   ceremony start). Populates :ceremony/public-key +
+   :ceremony/verification-shares on success."
+  (fsm/assign
+   (fn [{:keys [::pending-events :ceremony/results
+                :ceremony/expected-public-key-hex]
+         :as state} _event]
+     (let [pks (->> results vals (map :result/public-key-hex) (into #{}))]
+       (cond
+         (and (= 1 (count pks))
+              (= (first pks) expected-public-key-hex))
+         (do (swap! pending-events conj :event/finalization-passed)
+             (-> state
+                 (assoc :ceremony/public-key (first pks))
+                 (assoc :ceremony/verification-shares
+                        (into {} (for [[r m] results]
+                                   [r (:result/verification-share-hex m)])))))
+
+         (and (= 1 (count pks))
+              (not= (first pks) expected-public-key-hex))
+         (do (swap! pending-events conj :event/finalization-failed)
+             (assoc state :ceremony/error :reason/public-key-not-preserved))
+
+         :else
+         (do (swap! pending-events conj :event/finalization-failed)
+             (assoc state :ceremony/error :reason/public-key-disagreement)))))))
+
 (def ^:private keygen-consistency-check
   "Keygen-specific finalization check. Reads per-party results and
    verifies all parties report the same public-key-hex. On agreement:
@@ -267,6 +297,7 @@
    :action/share-proof-shape-check          check-results-collected
    :action/keygen-consistency-check         keygen-consistency-check
    :action/sign-consistency-check           sign-consistency-check
+   :action/reshare-consistency-check        reshare-consistency-check
    :action/notify-coordinator-success       notify-coordinator-success
    :action/persist-result-handles           persist-result-handles
    :action/send-cancel-to-all-participants  send-cancel-to-all-participants
@@ -484,6 +515,64 @@
                        :ceremony/presig-handle presig-handle}]
     (run-chart-fsm! orch peers chart-path domain-ctx make-begin build-result
                     deadline-ms)))
+
+(defn run-reshare-via-chart
+  "Chart-driven equivalent of ceremony/run-reshare. Covers all three
+   reshare flavors: recovery (old-peers ≠ new-peers, lost holder
+   replaced), refresh (old-peers == new-peers, fresh polynomial),
+   and divorce (old-peers ≠ new-peers, member removed).
+
+   Per cait-sith, only new-participants run the protocol; old-only
+   participants are referenced via begin-message metadata.
+
+   On success:
+     {:public-key <preserved hex>
+      :share-handle <new uuid>
+      :handles {role <uuid>}
+      :verification-shares {role <hex>}
+      :ceremony/id <uuid>}"
+  [{:keys [participant-ids identity-pubkeys] :as orch}
+   {:keys [old-participants new-participants old-threshold new-threshold
+           old-share-handle public-key-hex deadline-ms chart-path]
+    :or   {old-threshold 2
+           new-threshold 2
+           deadline-ms   60000
+           chart-path    "../specs/executable/statechart-reshare.edn"}}]
+  (assert public-key-hex "run-reshare-via-chart: :public-key-hex required (continuity anchor)")
+  (let [ceremony-id      (uuidv7/uuidv7)
+        new-share-handle (uuidv7/uuidv7)
+        protocol-runners (vec new-participants)
+        all-roles        (distinct (concat old-participants new-participants))
+        ids              (select-keys participant-ids all-roles)
+        peer-pubkeys     (select-keys identity-pubkeys protocol-runners)
+        make-begin       (fn [me]
+                           {:msg/type                  :ceremony/begin-reshare
+                            :ceremony/id               ceremony-id
+                            :ceremony/me               me
+                            :ceremony/old-peers        (vec old-participants)
+                            :ceremony/old-threshold    old-threshold
+                            :ceremony/new-peers        (vec new-participants)
+                            :ceremony/new-threshold    new-threshold
+                            :ceremony/participant-ids  ids
+                            :ceremony/peer-pubkeys     peer-pubkeys
+                            :ceremony/old-share-handle (when (some #{me} old-participants)
+                                                         old-share-handle)
+                            :ceremony/new-share-handle new-share-handle
+                            :ceremony/public-key-hex   public-key-hex})
+        build-result     (fn [state]
+                           {:public-key          (:ceremony/public-key state)
+                            :share-handle        new-share-handle
+                            :handles             (into {} (for [r protocol-runners]
+                                                            [r new-share-handle]))
+                            :verification-shares (:ceremony/verification-shares state)
+                            :ceremony/id         ceremony-id})
+        domain-ctx       {:ceremony/id                      ceremony-id
+                          :ceremony/participants            protocol-runners
+                          :ceremony/expected-public-key-hex public-key-hex
+                          :ceremony/old-share-handle        old-share-handle
+                          :ceremony/new-share-handle        new-share-handle}]
+    (run-chart-fsm! orch protocol-runners chart-path domain-ctx
+                    make-begin build-result deadline-ms)))
 
 (defn run-sign-via-chart
   "Chart-driven equivalent of ceremony/run-sign. Consumes the keygen
