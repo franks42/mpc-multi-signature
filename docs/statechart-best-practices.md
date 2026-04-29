@@ -181,7 +181,7 @@ next transition (e.g. "consistency check passes → finalize"), the
 action can't directly fire an event in clj-statecharts. The pattern:
 
 ```clojure
-(defn- triple-shape-check
+(defn- check-results-collected
   [{:keys [::pending-events :ceremony/results] :as state} _event]
   (swap! pending-events conj
          (if (every-result-ok? results)

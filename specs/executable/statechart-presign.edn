@@ -90,7 +90,7 @@
   ;; No orchestrator-side check; just confirm every participant
   ;; returned a result, then queue :event/finalization-passed.
   {:entry [:action/collect-per-party-results
-           :action/presig-shape-check]
+           :action/check-results-collected]
    :on   {:event/finalization-passed
           {:target :state/complete}
 

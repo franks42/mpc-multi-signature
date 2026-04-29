@@ -122,7 +122,7 @@
   ;; check-results-collected fn passes by construction here, since
   ;; we only reach :finalizing when every party recorded as done.
   {:entry [:action/collect-per-party-results
-           :action/share-proof-shape-check]
+           :action/check-results-collected]
    :on   {:event/finalization-passed
           {:target :state/complete}
 

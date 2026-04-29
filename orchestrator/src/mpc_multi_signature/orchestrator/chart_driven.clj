@@ -113,12 +113,10 @@
 
 (defn- check-results-collected
   "Generic shape check for ceremonies with no orchestrator-side
-   cross-party consistency check (triple-gen, presign). Confirms every
-   participant returned a result map, then queues
-   :event/finalization-passed (or -failed). Charts that need this
-   reference it via ceremony-specific action keywords (e.g.
-   :action/triple-shape-check, :action/presig-shape-check) — both
-   resolve to this same function."
+   cross-party consistency check. Confirms every participant returned
+   a result map, then queues :event/finalization-passed (or -failed).
+   Used by triple-generation, presign, and share-possession-proof
+   under the chart action keyword :action/check-results-collected."
   [{:keys [::participants ::pending-events :ceremony/results] :as state}
    _event]
   (let [ok? (every? #(some? (get results %)) participants)]
@@ -299,14 +297,11 @@
    :action/route-message                    route-message
    :action/record-party-done                record-party-done
    :action/collect-per-party-results        collect-per-party-results
-   ;; Ceremony-specific action keywords aliased to the same
-   ;; "every party returned a result" check function. Used by
-   ;; ceremonies that have no orchestrator-side cross-party check —
-   ;; the protocol's own verification or the verifier's downstream
-   ;; check governs correctness.
-   :action/triple-shape-check               check-results-collected
-   :action/presig-shape-check               check-results-collected
-   :action/share-proof-shape-check          check-results-collected
+   ;; Generic shape check for ceremonies with no orchestrator-side
+   ;; cross-party consistency check (the protocol's own verification
+   ;; or the verifier's downstream check governs correctness). Used
+   ;; by triple-generation, presign, and share-possession-proof.
+   :action/check-results-collected          check-results-collected
    :action/keygen-consistency-check         keygen-consistency-check
    :action/sign-consistency-check           sign-consistency-check
    :action/reshare-consistency-check        reshare-consistency-check
