@@ -1,86 +1,58 @@
 (ns mpc-multi-signature.orchestrator.chart-conformance-test
-  "Chart conformance tests. For each ceremony chart in specs/, build a
-   clj-statecharts machine via chart-runtime/chart->machine-spec and
-   drive it through the event sequence that mirrors how the
-   procedural implementation actually runs the ceremony. Pass = the
-   chart is internally consistent and the implementation's
-   transitions match the chart.
+  "Conformance tests for the EXECUTABLE charts under specs/executable/.
 
-   These tests do not exercise the cryptographic protocol — they
-   exercise only the orchestrator-side state-machine shape. Stage 1
-   conformance: no drift between chart and procedural code on
-   transition events, action wiring, and final-state reachability.
+   These tests verify the artifacts the runtime actually executes —
+   not the documentation charts under specs/, which intentionally
+   diverge for human readability. The retargeting from doc charts
+   to executable charts was recommended by both LLM reviewers (see
+   docs/review-gpt-20260428.md and docs/review-gemini-20260428.md).
 
-   The action registry uses recording stubs so every invocation is
-   traced; tests assert both reachability and that the expected
-   actions fired in the expected order.
+   Three classes of test:
 
-   Run from the orchestrator/ directory:
-     clojure -M:test -n mpc-multi-signature.orchestrator.chart-conformance-test"
+   1. Registry resolution — every :action/* keyword referenced by
+      every executable chart resolves in chart-driven/action-registry;
+      every (guard/X) symbol resolves in
+      chart-driven/guard-registry.
+
+   2. Structural properties — every non-final state handles
+      :event/cancel; :state/complete reachable only via
+      :state/finalizing; :state/failed reachable only via
+      :state/pending or :state/aborting.
+
+   3. Happy-path drive — for each ceremony, drive the FSM through
+      the expected event sequence and assert it reaches
+      :state/complete with the right actions fired."
   (:require [clojure.edn :as edn]
+            [clojure.set :as set]
             [clojure.test :refer [deftest is testing]]
+            [mpc-multi-signature.orchestrator.chart-driven :as cd]
             [mpc-multi-signature.orchestrator.chart-runtime :as cr]
             [statecharts.core :as fsm]))
 
 ;; ============================================================
-;; Recording stubs
+;; The six executable ceremony charts
 ;; ============================================================
 
-(defn- recording-action-registry
-  "Build an action registry where every action keyword resolves to a
-   stub fn that records its invocation in `calls` (atom holding a
-   vector of action keywords) and returns state unchanged."
-  [calls action-keywords]
-  (into {}
-        (for [k action-keywords]
-          [k (fn [state _event]
-               (swap! calls conj k)
-               state)])))
+(def ^:private executable-charts
+  ["keygen"
+   "triple-generation"
+   "presign"
+   "share-possession-proof"
+   "sign"
+   "reshare"])
 
-(defn- stateful-guard-registry
-  "A guard registry where the predicates dispatch on a guard-state
-   atom. Tests bind the atom to choose which guard wins.
-
-   For triple-generation, the relevant case is:
-     :event/ceremony-complete in :state/running has two transitions:
-       guard (guard/at-least-one-party-still-running) → stay in :running
-       guard (guard/all-parties-done-after-this-event) → → :finalizing
-
-   The test cycles the guard-state {:remaining N} atom — N>1 keeps us
-   in :running, N==1 advances us to :finalizing."
-  [guard-state]
-  {'guard/at-least-one-party-still-running
-   (fn [& _args]
-     (fn [_state _event] (> (:remaining @guard-state 0) 1)))
-
-   'guard/all-parties-done-after-this-event
-   (fn [& _args]
-     (fn [_state _event] (= (:remaining @guard-state 0) 1)))
-
-   'guard/originated-from
-   (fn [& _args]
-     (fn [_state _event] true))
-
-   'guard/objection-window-required
-   (fn [& _args]
-     (fn [_state _event] (:objection-window? @guard-state false)))
-
-   'guard/objection-window-not-required
-   (fn [& _args]
-     (fn [_state _event] (not (:objection-window? @guard-state false))))})
-
-;; ============================================================
-;; Helpers for loading + building
-;; ============================================================
-
-(defn- load-chart [chart-name]
+(defn- load-executable [chart-name]
   (edn/read-string {:default tagged-literal}
-                   (slurp (str "../specs/statechart-" chart-name ".edn"))))
+                   (slurp (str "../specs/executable/statechart-"
+                               chart-name ".edn"))))
 
-(defn- collect-action-keywords
-  "Walk a chart spec, collect every keyword that appears in
-   :entry / :exit / :actions positions. Used to build a complete
-   recording registry without enumerating by hand."
+;; ============================================================
+;; Walkers
+;; ============================================================
+
+(defn- walk-chart-actions
+  "Return a set of every :action/* keyword referenced anywhere in the
+   chart (in :entry, :exit, or :actions positions)."
   [chart]
   (let [acc (atom #{})
         walk (fn walk [node]
@@ -101,221 +73,378 @@
     (walk chart)
     @acc))
 
+(defn- walk-chart-guard-symbols
+  "Return a set of every guard/X symbol referenced anywhere in the
+   chart's :guards lists. Charts use list form like
+   `(guard/all-parties-done-after-this-event)` — the symbol head is
+   what the guard registry keys on."
+  [chart]
+  (let [acc (atom #{})
+        walk (fn walk [node]
+               (cond
+                 (map? node)
+                 (doseq [[k v] node]
+                   (cond
+                     (= :guards k)
+                     (when (sequential? v)
+                       (doseq [g v]
+                         (when (and (sequential? g)
+                                    (symbol? (first g))
+                                    (= "guard" (namespace (first g))))
+                           (swap! acc conj (first g)))))
+
+                     :else (walk v)))
+
+                 (sequential? node) (doseq [x node] (walk x))))]
+    (walk chart)
+    @acc))
+
+(defn- walk-chart-states
+  "Return a map of state-key → state-spec for every state defined
+   under :statechart/states (top-level only — these charts have no
+   nested compound states or parallel regions by design)."
+  [chart]
+  (:statechart/states chart))
+
+;; ============================================================
+;; 1. Registry resolution
+;; ============================================================
+
+(deftest every-chart-action-resolves-in-runtime-registry
+  (testing "every :action/* keyword in every executable chart has a
+            corresponding entry in chart-driven/action-registry"
+    (let [registered (set (keys cd/action-registry))]
+      (doseq [chart-name executable-charts]
+        (let [chart       (load-executable chart-name)
+              referenced  (walk-chart-actions chart)
+              unresolved  (set/difference referenced registered)]
+          (is (empty? unresolved)
+              (str chart-name " references unresolved action(s): "
+                   unresolved)))))))
+
+(deftest every-chart-guard-resolves-in-runtime-registry
+  (testing "every (guard/X) symbol in every executable chart has a
+            corresponding entry in chart-driven/guard-registry"
+    (let [registered (set (keys cd/guard-registry))]
+      (doseq [chart-name executable-charts]
+        (let [chart       (load-executable chart-name)
+              referenced  (walk-chart-guard-symbols chart)
+              unresolved  (set/difference referenced registered)]
+          (is (empty? unresolved)
+              (str chart-name " references unresolved guard(s): "
+                   unresolved)))))))
+
+;; ============================================================
+;; 2. Structural properties
+;; ============================================================
+
+(defn- final-state? [state-spec]
+  (= :final (:type state-spec)))
+
+(defn- has-cancel-handler? [state-spec]
+  (contains? (:on state-spec) :event/cancel))
+
+(deftest every-non-final-state-handles-cancel
+  (testing "for each executable chart, every state whose :type is not
+            :final (excluding :state/aborting, which exits via its own
+            :event/all-parties-acked-cancel + :event/abort-timeout-elapsed)
+            has an :event/cancel transition"
+    (doseq [chart-name executable-charts]
+      (let [chart  (load-executable chart-name)
+            states (walk-chart-states chart)]
+        (doseq [[state-key state-spec] states
+                :when (and (not (final-state? state-spec))
+                           (not= state-key :state/aborting))]
+          (is (has-cancel-handler? state-spec)
+              (str chart-name " state " state-key
+                   " has no :event/cancel handler")))))))
+
+(defn- transitions-from
+  "Return a seq of [event target] pairs for every transition out of
+   `state-spec`. Handles :on map values that may be: a target keyword,
+   a single transition map, or a vector of guarded transitions."
+  [state-spec]
+  (mapcat (fn [[event on-value]]
+            (cond
+              (keyword? on-value) [[event on-value]]
+              (map? on-value)     [[event (:target on-value)]]
+              (vector? on-value)  (map (fn [t] [event (:target t)]) on-value)
+              :else               []))
+          (:on state-spec)))
+
+(defn- states-pointing-to
+  "Return the set of state keys whose `:on` transitions can land at
+   target-state."
+  [chart target-state]
+  (let [states (walk-chart-states chart)]
+    (into #{}
+          (for [[from-key state-spec] states
+                [_ tgt] (transitions-from state-spec)
+                :when (= tgt target-state)]
+            from-key))))
+
+(deftest complete-only-via-finalizing
+  (testing "for each executable chart, :state/complete is reachable
+            only from :state/finalizing"
+    (doseq [chart-name executable-charts]
+      (let [chart    (load-executable chart-name)
+            sources  (states-pointing-to chart :state/complete)]
+        (is (or (empty? sources)
+                (= sources #{:state/finalizing}))
+            (str chart-name ": :state/complete reachable from "
+                 sources " (expected only #{:state/finalizing})"))))))
+
+(deftest failed-only-via-pending-or-aborting
+  (testing "for each executable chart, :state/failed is reachable
+            only from :state/pending (early cancel) or :state/aborting
+            (post-cancel cleanup)"
+    (doseq [chart-name executable-charts]
+      (let [chart   (load-executable chart-name)
+            sources (states-pointing-to chart :state/failed)
+            allowed #{:state/pending :state/aborting}]
+        (is (set/subset? sources allowed)
+            (str chart-name ": :state/failed reachable from "
+                 sources " (expected subset of " allowed ")"))))))
+
+;; ============================================================
+;; 3. Happy-path drives (using the real runtime registries)
+;; ============================================================
+
 (defn- build-machine
-  ([chart-name calls]
-   (build-machine chart-name calls (atom {:remaining 2 :objection-window? false})))
-  ([chart-name calls guard-state]
-   (let [chart   (load-chart chart-name)
-         actions (collect-action-keywords chart)
-         areg    (recording-action-registry calls actions)
-         greg    (stateful-guard-registry guard-state)]
-     (fsm/machine (cr/chart->machine-spec chart areg greg)))))
+  "Build a clj-statecharts machine for the named executable chart
+   using the REAL runtime registries — verifies translator and
+   registries compose without error."
+  [chart-name]
+  (let [chart (load-executable chart-name)]
+    (fsm/machine
+     (cr/chart->machine-spec chart cd/action-registry cd/guard-registry))))
+
+(defn- runtime-context
+  "Convert the test's plumbing context into one whose plumbing keys
+   match what chart_driven's action fns expect (their :: keys are in
+   the chart-driven namespace)."
+  [participants result-promise pending-events]
+  ;; chart_driven actions destructure ::orch, ::participants, etc.
+  ;; Build the map with those exact keyword identities.
+  {:ceremony/participants    participants
+   :ceremony/per-party-state (into {} (for [r participants]
+                                        [r :party-state/awaiting]))
+   :ceremony/results         {}
+   :ceremony/error           nil
+   :mpc-multi-signature.orchestrator.chart-driven/orch              nil
+   :mpc-multi-signature.orchestrator.chart-driven/participants      participants
+   :mpc-multi-signature.orchestrator.chart-driven/make-begin        (constantly nil)
+   :mpc-multi-signature.orchestrator.chart-driven/build-result      (constantly :stub-result)
+   :mpc-multi-signature.orchestrator.chart-driven/result-promise    result-promise
+   :mpc-multi-signature.orchestrator.chart-driven/pending-events    pending-events})
 
 (defn- terminal? [state]
-  (let [v (:_state state)]
-    (or (= v :state/complete) (= v :state/failed))))
+  (#{:state/complete :state/failed} (:_state state)))
 
-;; ============================================================
-;; Conformance: triple-generation
-;; ============================================================
+;; --- Triple-generation: 2 parties, no consistency check -------
 
 (deftest triple-generation-happy-path
-  (testing "triple-generation chart drives cleanly from begin-ceremony to complete"
-    (let [calls       (atom [])
-          guard-state (atom {:remaining 2})
-          machine     (build-machine "triple-generation" calls guard-state)
-          s0 (fsm/initialize machine)]
-      (is (= :state/pending (:_state s0)))
-      (let [s1 (fsm/transition machine s0 :event/begin-ceremony)]
-        (is (= :state/starting (:_state s1)))
-        (is (every? (set @calls)
-                    [:action/record-deadline
-                     :action/record-handles
-                     :action/send-begin-to-all-participants
-                     :action/start-deadline-timer]))
-        (let [s2 (fsm/transition machine s1 :event/protocol-message-emit)]
-          (is (map? (:_state s2)) "running has parallel substructure")
-          (is (= :state/running (first (keys (:_state s2))))
-              "outer state key is :state/running")
-          ;; First :event/ceremony-complete: 2 parties remaining → first
-          ;; guard wins, stay in :state/running, 1 party still pending
-          (let [s3 (fsm/transition machine s2 :event/ceremony-complete)]
-            (is (map? (:_state s3)) "still in parallel :state/running")
-            (swap! guard-state assoc :remaining 1)
-            ;; Second :event/ceremony-complete: now 1 remaining → second
-            ;; guard wins, advance to :state/finalizing
-            (let [s4 (fsm/transition machine s3 :event/ceremony-complete)]
-              (is (= :state/finalizing (:_state s4)))
-              (is (some #{:action/collect-per-party-results} @calls))
-              (is (some #{:action/triple-shape-check} @calls))
-              (let [s5 (fsm/transition machine s4 :event/finalization-passed)]
-                (is (= :state/complete (:_state s5)))
-                (is (terminal? s5))
-                (is (some #{:action/notify-coordinator-success} @calls))
-                (is (some #{:action/persist-result-handles} @calls))))))))))
+  (testing "triple-generation executable chart drives :pending →
+            :starting → :running → :finalizing → :complete with 2 parties"
+    (let [machine (build-machine "triple-generation")
+          peers   [:holder :figure]
+          rp      (promise)
+          pe      (atom [])
+          s0      (fsm/initialize machine
+                                  {:context (runtime-context peers rp pe)})
+          s1      (fsm/transition machine s0 {:type :event/begin-ceremony})
+          s2      (fsm/transition machine s1 {:type :event/protocol-message-emit
+                                              :from :holder
+                                              :msg/type :protocol/broadcast})
+          s3      (fsm/transition machine s2 {:type :event/ceremony-complete
+                                              :from :holder
+                                              :result {:result/triple-handle "h1"}})
+          s4      (fsm/transition machine s3 {:type :event/ceremony-complete
+                                              :from :figure
+                                              :result {:result/triple-handle "h2"}})]
+      (is (= :state/pending    (:_state s0)))
+      (is (= :state/starting   (:_state s1)))
+      (is (= :state/running    (:_state s2)))
+      (is (= :state/running    (:_state s3)) "first complete: stay in :running")
+      (is (= :state/finalizing (:_state s4)) "second (last) complete: advance to :finalizing")
+      ;; The :finalizing entry action queues :event/finalization-passed
+      (is (= [:event/finalization-passed] @pe))
+      (let [s5 (fsm/transition machine s4 (first @pe))]
+        (is (= :state/complete (:_state s5)))
+        (is (terminal? s5))))))
 
-(deftest triple-generation-cancel-from-pending
-  (testing "cancel from :state/pending takes us straight to :state/failed"
-    (let [calls   (atom [])
-          machine (build-machine "triple-generation" calls)
-          s0      (fsm/initialize machine)
-          s1      (fsm/transition machine s0 :event/cancel)]
-      (is (= :state/failed (:_state s1)))
-      (is (terminal? s1))
-      (is (some #{:action/record-cancel-reason} @calls)))))
+;; --- Keygen: 3 parties + real consistency check ----------------
 
-(deftest triple-generation-deadline-from-running
-  (testing "deadline-elapsed in :state/running aborts cleanly"
-    (let [calls   (atom [])
-          machine (build-machine "triple-generation" calls)
-          s0      (fsm/initialize machine)
-          s1      (fsm/transition machine s0 :event/begin-ceremony)
-          s2      (fsm/transition machine s1 :event/protocol-message-emit)
-          s3      (fsm/transition machine s2 :event/deadline-elapsed)]
-      (is (= :state/aborting (:_state s3)))
-      (let [s4 (fsm/transition machine s3 :event/all-parties-acked-cancel)]
-        (is (= :state/failed (:_state s4)))
-        (is (some #{:action/record-timeout} @calls))
-        (is (some #{:action/notify-coordinator-failure} @calls))))))
+(deftest keygen-happy-path-with-consistency
+  (testing "keygen executable chart: 3 parties report agreeing
+            public-keys, consistency check passes, terminal :complete"
+    (let [machine (build-machine "keygen")
+          peers   [:holder :figure :ic]
+          rp      (promise)
+          pe      (atom [])
+          s0      (fsm/initialize machine
+                                  {:context (runtime-context peers rp pe)})
+          s1      (fsm/transition machine s0 {:type :event/begin-ceremony})
+          s2      (fsm/transition machine s1 {:type :event/protocol-message-emit
+                                              :from :holder
+                                              :msg/type :protocol/broadcast})
+          ;; All three parties report the SAME public-key
+          mk-result (fn [_role] {:result/public-key-hex "0xabc"
+                                 :result/verification-share-hex "0xv"})
+          s3      (fsm/transition machine s2 {:type :event/ceremony-complete
+                                              :from :holder
+                                              :result (mk-result :holder)})
+          s4      (fsm/transition machine s3 {:type :event/ceremony-complete
+                                              :from :figure
+                                              :result (mk-result :figure)})
+          s5      (fsm/transition machine s4 {:type :event/ceremony-complete
+                                              :from :ic
+                                              :result (mk-result :ic)})]
+      (is (= :state/finalizing (:_state s5)))
+      (is (= [:event/finalization-passed] @pe))
+      (let [s6 (fsm/transition machine s5 (first @pe))]
+        (is (= :state/complete (:_state s6)))
+        (is (= "0xabc" (:ceremony/public-key s6)))))))
 
-;; ============================================================
-;; Conformance: keygen
-;; ============================================================
+(deftest keygen-public-key-disagreement-fails
+  (testing "keygen consistency check rejects when parties disagree on
+            public-key — finalization-failed → aborting → failed"
+    (let [machine (build-machine "keygen")
+          peers   [:holder :figure :ic]
+          rp      (promise)
+          pe      (atom [])
+          s0      (fsm/initialize machine
+                                  {:context (runtime-context peers rp pe)})
+          s1      (fsm/transition machine s0 {:type :event/begin-ceremony})
+          s2      (fsm/transition machine s1 {:type :event/protocol-message-emit
+                                              :from :holder
+                                              :msg/type :protocol/broadcast})
+          s3      (fsm/transition machine s2 {:type :event/ceremony-complete
+                                              :from :holder
+                                              :result {:result/public-key-hex "0xabc"
+                                                       :result/verification-share-hex "0xv"}})
+          s4      (fsm/transition machine s3 {:type :event/ceremony-complete
+                                              :from :figure
+                                              :result {:result/public-key-hex "0xabc"
+                                                       :result/verification-share-hex "0xv"}})
+          ;; IC reports a DIFFERENT public-key — disagreement
+          s5      (fsm/transition machine s4 {:type :event/ceremony-complete
+                                              :from :ic
+                                              :result {:result/public-key-hex "0xdef"
+                                                       :result/verification-share-hex "0xv"}})]
+      (is (= :state/finalizing (:_state s5)))
+      (is (= [:event/finalization-failed] @pe))
+      (is (= :reason/public-key-disagreement (:ceremony/error s5))))))
 
-(deftest keygen-happy-path
-  (testing "keygen chart drives cleanly from begin to complete with 3 parties"
-    (let [calls       (atom [])
-          guard-state (atom {:remaining 3})
-          machine     (build-machine "keygen" calls guard-state)
-          s0          (fsm/initialize machine)
-          s1          (fsm/transition machine s0 :event/begin-ceremony)
-          s2          (fsm/transition machine s1 :event/protocol-message-emit)]
-      (is (= :state/pending  (:_state s0)))
-      (is (= :state/starting (:_state s1)))
-      (is (map? (:_state s2)) ":state/running with 3 parallel regions")
-      ;; 3 parties → first two completes stay in running, third advances
-      (let [s3 (fsm/transition machine s2 :event/ceremony-complete)
-            _  (swap! guard-state assoc :remaining 2)
-            s4 (fsm/transition machine s3 :event/ceremony-complete)
-            _  (swap! guard-state assoc :remaining 1)
-            s5 (fsm/transition machine s4 :event/ceremony-complete)]
-        (is (= :state/finalizing (:_state s5)))
-        (let [s6 (fsm/transition machine s5 :event/finalization-passed)]
-          (is (= :state/complete (:_state s6)))
-          (is (terminal? s6)))))))
+;; --- Cancel from each non-final state ---------------------------
 
-;; ============================================================
-;; Conformance: sign
-;; ============================================================
+(deftest cancel-from-each-non-final-state-reaches-failed
+  (testing "for each executable chart, :event/cancel from each
+            non-final state must end at :state/failed"
+    (doseq [chart-name executable-charts]
+      (let [chart   (load-executable chart-name)
+            states  (walk-chart-states chart)]
+        ;; Cancel semantics:
+        ;;   - :state/pending → cancel goes direct to :state/failed
+        ;;   - :state/aborting handles its own exit via
+        ;;     :event/all-parties-acked-cancel and abort-timeout, so
+        ;;     :event/cancel is not required there
+        ;;   - All other non-final states: cancel should land at
+        ;;     :state/aborting (which then forwards to :state/failed)
+        (doseq [[state-key state-spec] states
+                :when (and (not (final-state? state-spec))
+                           (not= state-key :state/aborting))
+                :let  [cancel-tx (get-in state-spec [:on :event/cancel])]]
+          ;; Verify there's a cancel handler that targets either
+          ;; :state/aborting or :state/failed (depending on state)
+          (is cancel-tx
+              (str chart-name " state " state-key
+                   " has no :event/cancel transition"))
+          (let [tx-target (cond
+                            (keyword? cancel-tx) cancel-tx
+                            (map? cancel-tx)     (:target cancel-tx)
+                            :else                nil)]
+            (is (#{:state/aborting :state/failed} tx-target)
+                (str chart-name " state " state-key
+                     " :event/cancel target is " tx-target
+                     " (expected :state/aborting or :state/failed)"))))))))
 
-(deftest sign-happy-path
-  (testing "sign chart drives policy-check → starting → running → complete"
-    (let [calls       (atom [])
-          guard-state (atom {:remaining 2})
-          machine     (build-machine "sign" calls guard-state)
-          s0          (fsm/initialize machine)
-          s1          (fsm/transition machine s0 :event/sign-request-received)]
-      (is (= :state/pending      (:_state s0)))
-      (is (= :state/policy-check (:_state s1)))
-      (let [s2 (fsm/transition machine s1 :event/policy-pass)]
-        (is (= :state/starting (:_state s2)))
-        (is (some #{:action/select-presignature} @calls))
-        (let [s3 (fsm/transition machine s2 :event/protocol-message-emit)
-              s4 (fsm/transition machine s3 :event/ceremony-complete)
-              _  (swap! guard-state assoc :remaining 1)
-              s5 (fsm/transition machine s4 :event/ceremony-complete)
-              s6 (fsm/transition machine s5 :event/finalization-passed)]
-          (is (= :state/complete (:_state s6)))
-          (is (some #{:action/release-presignature} @calls)
-              "sign chart's :state/complete entry should fire :action/release-presignature"))))))
+;; --- Sign: asymmetric result ------------------------------------
 
-(deftest sign-policy-fail
-  (testing "sign chart policy-fail goes straight to :state/failed"
-    (let [calls   (atom [])
-          machine (build-machine "sign" calls)
-          s0      (fsm/initialize machine)
-          s1      (fsm/transition machine s0 :event/sign-request-received)
-          s2      (fsm/transition machine s1 :event/policy-fail)]
-      (is (= :state/failed (:_state s2)))
-      (is (some #{:action/record-policy-rejection} @calls)))))
+(deftest sign-coordinator-only-signature-passes
+  (testing "sign chart: coordinator returns a signature, others nil
+            → consistency-check passes, :state/complete reached"
+    (let [machine (build-machine "sign")
+          peers   [:holder :figure]
+          rp      (promise)
+          pe      (atom [])
+          ctx     (-> (runtime-context peers rp pe)
+                      (assoc :ceremony/coordinator :figure))
+          s0      (fsm/initialize machine {:context ctx})
+          s1      (fsm/transition machine s0 {:type :event/begin-ceremony})
+          s2      (fsm/transition machine s1 {:type :event/protocol-message-emit
+                                              :from :holder
+                                              :msg/type :protocol/broadcast})
+          s3      (fsm/transition machine s2 {:type :event/ceremony-complete
+                                              :from :holder
+                                              :result {}}) ; no signature
+          s4      (fsm/transition machine s3 {:type :event/ceremony-complete
+                                              :from :figure
+                                              :result {:result/signature-hex "deadbeef"}})]
+      (is (= :state/finalizing (:_state s4)))
+      (is (= [:event/finalization-passed] @pe))
+      (is (= "deadbeef" (:ceremony/signature-hex s4))))))
 
-;; ============================================================
-;; Conformance: reshare-recovery (UC2)
-;; ============================================================
+;; --- Reshare: pubkey preservation ------------------------------
 
-(deftest reshare-recovery-no-objection-window
-  (testing "reshare-recovery: gate passes for both, no objection window, runs to complete"
-    (let [calls       (atom [])
-          guard-state (atom {:remaining 3 :objection-window? false})
-          machine     (build-machine "reshare-recovery" calls guard-state)
-          s0          (fsm/initialize machine)
-          s1          (fsm/transition machine s0 :event/begin-ceremony)]
-      (is (= :state/authorization-gate (:_state s1)))
-      (let [s2 (fsm/transition machine s1 :event/figure-gate-pass)
-            s3 (fsm/transition machine s2 :event/ic-gate-pass)
-            ;; Both gates passed; the synthesized :event/both-gates-passed
-            ;; should advance to starting (objection-window-not-required).
-            s4 (fsm/transition machine s3 :event/both-gates-passed)]
-        (is (= :state/starting (:_state s4)))
-        (let [s5 (fsm/transition machine s4 :event/protocol-message-emit)
-              ;; 3 new participants
-              s6 (fsm/transition machine s5 :event/ceremony-complete)
-              _  (swap! guard-state assoc :remaining 2)
-              s7 (fsm/transition machine s6 :event/ceremony-complete)
-              _  (swap! guard-state assoc :remaining 1)
-              s8 (fsm/transition machine s7 :event/ceremony-complete)]
-          (is (= :state/finalizing (:_state s8)))
-          (let [s9 (fsm/transition machine s8 :event/finalization-passed)]
-            (is (= :state/complete (:_state s9)))
-            (is (some #{:action/invalidate-old-holder-share-record} @calls))))))))
+(deftest reshare-pubkey-preserved-passes
+  (testing "reshare chart: all new participants report the same pubkey
+            equal to expected → finalization passes"
+    (let [machine (build-machine "reshare")
+          peers   [:figure :ic]
+          rp      (promise)
+          pe      (atom [])
+          ctx     (-> (runtime-context peers rp pe)
+                      (assoc :ceremony/expected-public-key-hex "0xabc"))
+          s0      (fsm/initialize machine {:context ctx})
+          s1      (fsm/transition machine s0 {:type :event/begin-ceremony})
+          s2      (fsm/transition machine s1 {:type :event/protocol-message-emit
+                                              :from :figure
+                                              :msg/type :protocol/broadcast})
+          mk-result (fn [_r] {:result/public-key-hex "0xabc"
+                              :result/verification-share-hex "0xv"})
+          s3      (fsm/transition machine s2 {:type :event/ceremony-complete
+                                              :from :figure
+                                              :result (mk-result :figure)})
+          s4      (fsm/transition machine s3 {:type :event/ceremony-complete
+                                              :from :ic
+                                              :result (mk-result :ic)})]
+      (is (= :state/finalizing (:_state s4)))
+      (is (= [:event/finalization-passed] @pe)))))
 
-(deftest reshare-recovery-with-objection-window
-  (testing "reshare-recovery: objection window required → published, then elapses"
-    (let [calls       (atom [])
-          guard-state (atom {:remaining 3 :objection-window? true})
-          machine     (build-machine "reshare-recovery" calls guard-state)
-          s0          (fsm/initialize machine)
-          s1          (fsm/transition machine s0 :event/begin-ceremony)
-          s2          (fsm/transition machine s1 :event/figure-gate-pass)
-          s3          (fsm/transition machine s2 :event/ic-gate-pass)
-          s4          (fsm/transition machine s3 :event/both-gates-passed)]
-      (is (= :state/objection-window (:_state s4)))
-      (is (some #{:action/publish-recovery-intent} @calls))
-      (let [s5 (fsm/transition machine s4 :event/objection-window-elapsed)]
-        (is (= :state/starting (:_state s5)))))))
-
-(deftest reshare-recovery-figure-gate-fail
-  (testing "reshare-recovery: figure-gate-fail aborts before any reshare work"
-    (let [calls   (atom [])
-          machine (build-machine "reshare-recovery" calls)
-          s0      (fsm/initialize machine)
-          s1      (fsm/transition machine s0 :event/begin-ceremony)
-          s2      (fsm/transition machine s1 :event/figure-gate-fail)]
-      (is (= :state/aborting (:_state s2)))
-      (is (some #{:action/record-figure-gate-fail} @calls)))))
-
-;; ============================================================
-;; Conformance: share-possession-proof
-;; ============================================================
-
-(deftest share-possession-proof-happy-path
-  (testing "share-possession-proof chart drives cleanly with no protocol relay"
-    (let [calls       (atom [])
-          guard-state (atom {:remaining 3})
-          machine     (build-machine "share-possession-proof" calls guard-state)
-          s0          (fsm/initialize machine)
-          s1          (fsm/transition machine s0 :event/begin-ceremony)
-          ;; In this chart, :state/starting transitions to :state/running on
-          ;; :event/ceremony-complete (no protocol-message-emit step).
-          s2          (fsm/transition machine s1 :event/ceremony-complete)]
-      (is (= :state/pending  (:_state s0)))
-      (is (= :state/starting (:_state s1)))
-      (is (map? (:_state s2)) "running with parallel regions")
-      (swap! guard-state assoc :remaining 2)
-      (let [s3 (fsm/transition machine s2 :event/ceremony-complete)
-            _  (swap! guard-state assoc :remaining 1)
-            s4 (fsm/transition machine s3 :event/ceremony-complete)]
-        (is (= :state/finalizing (:_state s4)))
-        (let [s5 (fsm/transition machine s4 :event/finalization-passed)]
-          (is (= :state/complete (:_state s5)))
-          (is (some #{:action/return-transcripts} @calls)))))))
+(deftest reshare-pubkey-drift-fails
+  (testing "reshare chart: parties report a pubkey that doesn't match
+            expected → finalization-failed"
+    (let [machine (build-machine "reshare")
+          peers   [:figure :ic]
+          rp      (promise)
+          pe      (atom [])
+          ctx     (-> (runtime-context peers rp pe)
+                      (assoc :ceremony/expected-public-key-hex "0xabc"))
+          s0      (fsm/initialize machine {:context ctx})
+          s1      (fsm/transition machine s0 {:type :event/begin-ceremony})
+          s2      (fsm/transition machine s1 {:type :event/protocol-message-emit
+                                              :from :figure
+                                              :msg/type :protocol/broadcast})
+          ;; Both parties agree, but they DRIFTED from expected
+          mk-result (fn [_r] {:result/public-key-hex "0xdef"
+                              :result/verification-share-hex "0xv"})
+          s3      (fsm/transition machine s2 {:type :event/ceremony-complete
+                                              :from :figure
+                                              :result (mk-result :figure)})
+          s4      (fsm/transition machine s3 {:type :event/ceremony-complete
+                                              :from :ic
+                                              :result (mk-result :ic)})]
+      (is (= :state/finalizing (:_state s4)))
+      (is (= [:event/finalization-failed] @pe))
+      (is (= :reason/public-key-not-preserved (:ceremony/error s4))))))

@@ -290,7 +290,9 @@
 ;; Registries
 ;; ============================================================
 
-(def ^:private action-registry
+(def action-registry
+  "Map of :action/* keyword → action fn. Public so conformance tests
+   can verify every chart reference resolves."
   {:action/record-handles                   record-handles
    :action/send-begin-to-all-participants   send-begin-to-all-participants
    :action/start-deadline-timer             start-deadline-timer
@@ -315,7 +317,10 @@
    :action/record-timeout                   record-timeout
    :action/notify-coordinator-failure       notify-coordinator-failure})
 
-(def ^:private guard-registry
+(def guard-registry
+  "Map of guard symbol → higher-order fn that returns a predicate.
+   Public so conformance tests can verify every chart reference
+   resolves."
   {'guard/at-least-one-party-still-running  guard-at-least-one-party-still-running
    'guard/all-parties-done-after-this-event guard-all-parties-done-after-this-event})
 
