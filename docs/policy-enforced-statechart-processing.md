@@ -469,13 +469,28 @@ neither changes the chart.
   profiles. Pick whichever fits the deployment without changing
   the chart shape or the contract.
 
-For readers who've encountered the historical camps: SPKI/SDSI
-(Rivest & Lampson, 1996) and Macaroons (Birgisson et al., 2014)
-both treat policy decisions as cryptographic verifications
-against trust roots — and they were right. They just predated
-chart-driven runtimes that give those verifications a clean
-enforcement skeleton. This document is, in some sense, the
-chart-driven enforcement skeleton those traditions wanted.
+For readers who've encountered the historical camps: SPKI
+(Ellison et al., RFC 2693, 1999) and SDSI (Rivest & Lampson,
+1996) — later merged as SPKI/SDSI — together with Macaroons
+(Birgisson et al., 2014) all treat policy decisions as
+cryptographic verifications against trust roots. They were right.
+They just predated chart-driven runtimes that give those
+verifications a clean enforcement skeleton.
+
+SPKI's design philosophy was the principled extreme of the
+capability stance: signed assertions travel with the bearer,
+fully self-contained, so *any* relying party can perform the
+complete verification end-to-end without trusting an
+intermediary. Twenty-five years of deployment experience showed
+that to be correct in principle but operationally heavy in
+practice — asking every consumer to handle full certificate
+chains, revocation, freshness, and policy semantics was a lot,
+and many systems retreated toward service-mediated verification
+for ergonomic reasons. The trust-roots view this document
+adopts is the natural reconciliation: the *operation* is
+identical in both models; what varies is **where it runs and
+who repeats it**. That's an operational choice, not an
+architectural one.
 
 ## What this looks like in chart EDN
 
