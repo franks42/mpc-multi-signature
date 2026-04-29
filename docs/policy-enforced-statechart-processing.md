@@ -4,25 +4,35 @@
 > decision — even before you have a policy engine — and how to make
 > those decisions structurally visible.
 
-This doc captures an architectural insight that surfaced during the
-chart-driven runtime work and shapes how Stage 5c business logic
-will be added. The short version:
+## The scenario
 
-**Statecharts already make policy decisions.** When you fire an
-event into an FSM, *something* decided that event was authorized.
-If you didn't write a Policy Decision Point, you wrote one
-implicitly — by allowing the call site to fire the event with no
-check.
+Imagine a system where multiple parties cooperatively perform
+sensitive operations on shared cryptographic state. An MPC wallet,
+say, where key generation, signing, and share rotation are all
+coordinated multi-party protocols. Each protocol is a *ceremony*:
+a defined lifecycle of message exchanges between parties, modeled
+as a statechart so the dance is explicit, auditable, and
+mechanically verifiable.
 
-The orchestrator REPL firing `(orch/keygen ...)` is making a policy
-decision: "this requestor is authorized to start a keygen ceremony."
-There's no PDP yet, so the decision is implicit (always yes), but
-it's a decision nonetheless.
+Some ceremonies should require authorization to start. Recovering
+a lost share, for instance, must verify the requestor's identity
+before any cryptographic work happens — otherwise an attacker can
+hijack a wallet by claiming "I lost my share." Other ceremonies
+may need lighter checks (routine signing) or none (background
+key-refresh). Either way, **somewhere a decision is being made
+about who can do what, when, under what conditions.**
 
-The thesis of this document: **make implicit policy decisions
-explicit, in the chart, before you have real policy.** That way
-the chart shape lands once. Real policy fills in over time without
-reshaping the chart.
+The question this doc addresses: where does that decision belong?
+In a separate policy subsystem orthogonal to the chart? In the
+chart's transition guards? Somewhere else? And what do you do
+*before* you've built the real policy engine — does the work just
+not happen, or is there an interim approach that surfaces the
+decisions structurally with very little code?
+
+The thesis: **make implicit policy decisions explicit, in the
+chart, before you have real policy.** That way the chart shape
+lands once. Real policy fills in over time without reshaping the
+chart.
 
 ## The implicit-decision insight
 
@@ -33,11 +43,11 @@ separate engine, alongside the chart."
 
 That framing is too clean. It hides what's actually happening.
 
-Consider the simplest thing the orchestrator does: a user types
-`(orch/keygen o [:holder :figure :ic] {:threshold 2})` at the REPL.
-The orchestrator fires `:event/begin-ceremony` into the FSM. The
-chart transitions from `:state/pending` to `:state/starting`. The
-ceremony begins.
+Consider the simplest thing such an orchestrator does: a user
+types something like `(begin-keygen orch [:party-a :party-b :party-c]
+{:threshold 2})` at a REPL. The orchestrator fires
+`:event/begin-ceremony` into the FSM. The chart transitions from
+`:state/pending` to `:state/starting`. The ceremony begins.
 
 Five questions were answered by something:
 
@@ -54,11 +64,12 @@ Every one of those questions has an answer. The orchestrator made
 those decisions. They just don't appear anywhere in the chart, the
 runtime, or the audit log. They are **implicit**.
 
-When Stage 5c lands a real KYC TAS, an address policy registry, an
-attestation freshness window, the answers to those five questions
-become explicit and verifiable. **But the questions themselves
-were always there.** Stage 5c isn't *adding* policy; it's making
-the policy that already exists *visible*.
+When the system eventually grows a real attestation service, an
+address-policy registry, an attestation freshness window, the
+answers to those five questions become explicit and verifiable.
+**But the questions themselves were always there.** Adding policy
+isn't *creating* policy; it's making the policy that already
+exists *visible*.
 
 ## Two failure modes
 
@@ -116,7 +127,7 @@ XACML:
 | Role | What it does | In this project |
 |---|---|---|
 | **PEP** (Policy Enforcement Point) | Knows *when* a decision is needed, *intercepts* the action, *enforces* the result. | The chart. Names the decision points as states; names the outcomes as events. |
-| **PDP** (Policy Decision Point) | Knows *what* the decision should be, given the inputs. | A separate evaluator (eventually `stroopwafel`-driven). Stateless function: request in, decision out. |
+| **PDP** (Policy Decision Point) | Knows *what* the decision should be, given the inputs. | A separate evaluator (a declarative policy engine, e.g. Datalog-based). Stateless function: request in, decision out. |
 | **PIP** (Policy Information Point) | Knows the *data* the decision depends on. | Registries: address policy, commitments, attestation cache. |
 
 The chart and the PDP are **co-designed at their interface**:
@@ -261,31 +272,67 @@ between `:state/pending` and `:state/starting`:
 ;; ... unchanged from current charts ...
 ```
 
-For reshare-flavored ceremonies, an additional
+For ceremonies that change the wallet's structure (a recovery, a
+divorce, a periodic refresh), an additional
 `:state/authorization-gate` state appears later in the lifecycle
-where Figure and IC each independently evaluate the recovery /
-divorce / refresh request. Same pattern, different policy
-question, two parallel PDP calls.
+where two or more parties each independently evaluate the
+request. Same pattern, different policy question, parallel PDP
+calls.
 
-## How this maps to the project's Stage 5c
+## Phasing the work
 
-The 5c plan reflects this thinking. The chart-shape work lands
-*first*, with trivial PDP, before any real policy logic exists:
+The work decomposes naturally into phases. The chart-shape work
+lands *first*, with trivial PDP, before any real policy logic
+exists. Each subsequent phase preserves the chart shape and
+either enriches the PDP or adds adjacent capabilities.
 
-- **5c.0a** — PDP infrastructure + universal `:state/begin-authorization` gate. Every executable chart gains the gate. PDP is trivial. **The chart shape lands here.**
-- **5c.0b** — Foundational-principle compliance (IC independence, KYC TAS as separate principal). PDP gains access to address-policy data; rules still trivial.
-- **5c.1** — Commitment registries (real persistent state).
-- **5c.2** — Attestation services. PDP starts checking attestation signatures — first real policy evaluation.
-- **5c.3** — Multi-party authorization gates for reshare-flavored ceremonies. Real `stroopwafel`-driven policy DSL replaces parts of the trivial PDP.
-- **5c.4** — Objection-window infrastructure (first ceremony with a real wait state).
-- **5c.5** — End-to-end UC2: the first ceremony the harness can REFUSE based on policy.
+1. **Scaffolding.** PDP infrastructure (with permit-all / deny-all
+   modes) plus a universal `:state/begin-authorization` gate added
+   to every executable chart. The PDP is trivial; every ceremony
+   still proceeds. **The chart shape lands here.**
 
-The crucial property: **chart shape doesn't change after 5c.0a.**
-Each subsequent substage either adds new charts (5c.1, 5c.2) or
-adds *new* states to *existing* charts (5c.3, 5c.4) — but the
+2. **Trust-root compliance.** External principals (KYC trust
+   attestation services, custodian operators) become first-class
+   actors with their own pubkeys registered in policy data. The
+   PDP starts to *consult* this data, even if its rules remain
+   trivial.
+
+3. **Persistent registries.** Address policies, commitment
+   ledgers, attestation caches — long-lived state outside the
+   per-ceremony FSM. The PDP can now query stable data across
+   ceremonies.
+
+4. **Attestation services as ceremonies.** Issuing an attestation
+   is itself a (single-party) ceremony. The PDP starts validating
+   attestation signatures — *first non-trivial policy evaluation*.
+
+5. **Multi-party authorization gates.** Reshare-flavored ceremonies
+   (recovery, refresh, divorce) gain `:state/authorization-gate`
+   states where two or more parties independently evaluate the
+   request. Real declarative policy rules (e.g., a Datalog DSL)
+   replace parts of the trivial PDP.
+
+6. **Wait-state infrastructure.** Time-bounded windows where
+   external observers can object to a pending structural change.
+   First ceremony with a real wait state; introduces durable
+   cross-restart state.
+
+7. **End-to-end policy-gated recovery.** All pieces wired
+   together: the first ceremony the system can REFUSE based on
+   policy, with the refusal reason recorded structurally in the
+   audit log.
+
+The crucial property: **chart shape doesn't change after the
+scaffolding phase.** Each subsequent phase either adds *new*
+charts or adds *new* states to *existing* charts, but the
 universal `:state/begin-authorization` gate stays put, and the
 trivial PDP gradually becomes a real one without changing where
 it's called from.
+
+Practitioners using this pattern in their own systems would
+adapt the specifics (which actor types, which attestation
+shapes, which wait-state semantics) but the **phasing principle**
+generalizes: chart-shape first, policy content gradually.
 
 ## Common confusions, addressed
 
