@@ -204,6 +204,16 @@ so `NotApplicable` represents a misconfiguration that the audit
 log can disambiguate via the reason keyword. We can promote it to
 a first-class category later if it earns its keep.)
 
+**One thing we deliberately don't carry over from XACML: the XML
+encoding.** Real XACML deployments paid a heavy operational toll
+for the XML-based policy language — verbosity, tooling fragility,
+poor authoring ergonomics, mismatch between how policies were
+written and how they were debugged. We use EDN throughout: chart
+definitions, the request/decision schemas defined below, and
+eventually the policy DSL itself. Same decision model, dramatically
+better encoding. The lesson from twenty years of XACML deployment
+is **the model was right; the syntax was the problem**.
+
 The four-way model matters because the chart needs to *route*
 each outcome differently:
 
