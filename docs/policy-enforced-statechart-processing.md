@@ -366,6 +366,117 @@ consumers. The PDP can grow richer policy-version semantics, more
 detailed reasons, and richer evidence-trace fields without the
 chart caring.
 
+## Capabilities and PDP calls: the same operation
+
+> **The whole distinction reduces to: bringing the policy with you
+> in a capability, or leaving it at a service.**
+
+A common misreading of the PEP/PDP framing imagines the PDP as a
+*service* — a centralized authorization oracle the PEP calls into
+over RPC. That picture has been actively defended for decades by
+people who built such services. There is also a long-running
+*capabilities* tradition (Lampson, Rivest, Miller, more recently
+the Macaroons line of work) that argues for the opposite: forget
+the central oracle; let principals carry **signed authorization
+assertions** they present at the point of access, and let the PEP
+verify them locally.
+
+For a long time these felt like opposing camps. They aren't.
+They're the same operation with the *locus* reversed: a
+capability is a previously-issued decision the bearer carries; a
+PDP call is an on-the-fly issuance the verifier performs. Same
+trust roots, same verification logic, just different choices
+about where the policy decision is materialized in space and
+time.
+
+**A PDP isn't a service — it's a function.** It takes a request,
+some presented evidence, a trust-root configuration, and a set of
+policy rules; it returns a decision. Whether the evidence is a
+remote oracle's RPC reply, a JWT signed by a trusted issuer, a
+ZK proof of a predicate, or a cryptographic capability with a
+delegation chain — **architecturally it's the same operation**:
+verify the evidence against the relevant trust roots, apply the
+policy that says "this kind of evidence, from this kind of
+authority, satisfies this requirement."
+
+The chart doesn't have to know which kind. It calls out to the
+policy evaluator and routes the answer.
+
+| Surface form | What it actually is |
+|---|---|
+| Remote PDP RPC | Policy: "ask the trusted PDP service" — trust root: the authenticated channel to the PDP |
+| JWT / bearer token | Policy: "verify signed claims about the bearer" — trust root: the issuer's registered pubkey |
+| Capability / macaroon | Policy: "verify the capability chain" — trust root: the chain's anchor, with each link possibly attenuating the rights |
+| Attestation (KYC, commitment, etc.) | Policy: "verify the authority signed this claim about this subject" — trust root: the attestation authority's pubkey |
+| ZK proof | Policy: "run the verifier on the proof" — trust root: the verifier program / its compiled circuit |
+| Threshold signature itself | Policy: "verify the signature against the wallet pubkey" — trust root: the registered wallet pubkey |
+
+That last row is where the unification gets really interesting:
+**the cryptographic ceremonies in a system like this one are
+themselves policy evaluations** in the trust-roots view.
+Verifying a share-possession proof? That's a PDP call against the
+trust root established at keygen. Verifying that a reshare
+preserved the public key? Same thing. The chart-driven runtime
+is *already* doing PDP-style evaluations; we just hadn't named
+them that.
+
+### Trust-root configuration is the durable artifact
+
+Once you accept this frame, the question "what's the policy?"
+splits cleanly into two parts:
+
+1. **Trust roots.** Which TAS pubkeys are trusted to issue KYC
+   attestations? Which owner-key pubkey is registered for this
+   wallet? Which IC operator? Which issuer is allowed to sign
+   recovery-intents? This is *configuration* — long-lived per-
+   wallet data living in the address-policy registry.
+
+2. **Policy rules.** Given a request and the configured trust
+   roots, what evidence combinations satisfy the request? "For a
+   recovery, the requestor must present {KYC attestation OR
+   commitment + 1 social} *and* a recovery-intent signed by the
+   registered owner-key." Short, declarative, evolves
+   independently of trust roots.
+
+The address-policy registry isn't "the policy"; it's **the
+trust-root configuration**. The policy rules are layered on top.
+This decomposition keeps each piece small and lets each evolve
+independently — adding a new TAS is a registry update; adding a
+new "what counts as recovery authorization" is a rule update;
+neither changes the chart.
+
+### What this means in practice
+
+- **One contract covers all evidence forms.** The PEP hands the
+  bundle to the evaluator. The evaluator's implementation may
+  internally call out (RPC), verify locally (capability), or
+  invoke a ZK verifier. The chart sees one shape: a request goes
+  in, a decision comes out.
+- **Capability issuance becomes a ceremony in the same harness.**
+  An attestation-issuance ceremony, a commitment-registration
+  ceremony, a recovery-intent signing — these are all
+  **evidence-producing ceremonies** that future
+  evidence-consuming ceremonies will check at their gates. Same
+  chart-driven runtime, same patterns, same trust-root
+  configuration.
+- **`:deferred` is sharply defined.** It's not a different *kind*
+  of decision; it's specifically "this particular evaluation
+  requires async I/O." Capability-style evaluations almost never
+  return `:deferred` because they're local crypto verifications.
+  RPC-style evaluations may. The chart routes them the same way.
+- **The capabilities-vs-services debate dissolves.** Same trust
+  roots, same verification logic, different operational
+  profiles. Pick whichever fits the deployment without changing
+  the chart shape or the contract.
+
+For readers who've encountered the historical camps: SPKI/SDSI
+(Rivest & Lampson, 1996) and Macaroons (Birgisson et al., 2014)
+both treat policy decisions as cryptographic verifications
+against trust roots — and they were right. They just predated
+chart-driven runtimes that give those verifications a clean
+enforcement skeleton. This document is, in some sense, the
+chart-driven enforcement skeleton those traditions wanted.
+
 ## What this looks like in chart EDN
 
 Every executable chart gains a `:state/begin-authorization` state
