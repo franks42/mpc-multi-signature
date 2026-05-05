@@ -61,9 +61,20 @@ for confidentiality/transport and share-possession proofs.
 
 **`docs/statechart-best-practices.md`** — patterns guide for
 writing executable ceremony charts. Read this before adding a new
-ceremony. The `fsm/assign` gotcha (pattern #1) is the single biggest
-trap; the transport-vs-crypto routing distinction (pattern #4b) is
-the second.
+ceremony. The `fsm/assign` gotcha (pattern #1, structurally
+enforced via the `defaction` macro) is the single biggest trap;
+the transport-vs-crypto routing distinction (pattern #4b) is
+the second; the wait-state-vs-terminal-abort distinction (pattern
+#10) is essential reading for Stage 5c work.
+
+**`docs/policy-enforced-statechart-processing.md`** — architectural
+design for how policy/authZ integrates into chart-driven ceremonies.
+Read this before any Stage 5c work. Key concepts: implicit
+decisions are real even before a PDP exists; chart owns *where*
+decisions are made, PDP owns *what* they say; four-way decision
+model (permit/deny/indeterminate/deferred — three from XACML, one
+async extension); capabilities and PDP RPC calls are duals (same
+trust roots, different locus); EDN, not XML.
 
 **`docs/mpc-feasibility-spike.md`** — proves cryptographic
 feasibility against NEAR's `threshold-signatures` crate with two
@@ -435,37 +446,79 @@ because they distinguished "verified" from "expected" from
 
 ## Stage 5c entry points
 
-Stages 0–5b plus the chart-driven runtime foundation are done. The
-harness runs every ceremony — keygen, triple-gen, presign, sign,
-reshare (recovery/refresh/divorce), share-possession-proof — through
-the chart-driven runtime end-to-end against real Noise_KK sessions
-and the crypto-core, with final signatures cross-verifying against
-original wallet pubkeys. The procedural ceremony.clj is gone;
-`orchestrator/.../chart_driven.clj` plus `specs/executable/` is the
-implementation. **What's next:**
+Stages 0–5b plus the chart-driven runtime foundation are done
+(tag `v0.7.0`). External LLM review was applied (tag `v0.7.1`):
+`defaction` macro now wraps `fsm/assign` structurally, action
+names are generic, conformance tests retargeted to executable
+charts (12 tests / 119 assertions on `specs/executable/`).
 
-**Stage 5c — business logic.** The traditional Stage 5 scope:
-commitment registries (Figure-side), commitment-gated reshare,
-publication/objection windows, multi-party authorization gates for
-recovery (Figure + IC verify attestations independently),
-attestation-issuance ceremonies (KYC TAS, commitment TAS, social
-recovery TAS). Per the design doc: "the architecture's payoff
-arrives — adding policy is bb-side logic, not orchestrator/crypto-
-core changes."
+**Policy-enforcement design** (added late April 2026 — read this
+before any 5c work) is in `docs/policy-enforced-statechart-processing.md`.
+Summary of the design choices that need to be honored:
 
-Adding a new ceremony in Stage 5c reduces to:
+- **Decision model is four-way: permit / deny / indeterminate /
+  deferred.** Three from XACML; deferred is the async extension.
+  `:permit` advances; `:deny` terminates with `:outcome :rejected`
+  in the result payload; `:indeterminate` terminates with
+  `:outcome :error`; `:deferred` holds in the gate state pending
+  external answer.
+- **Gates are real chart states**, not transition guards.
+  `:state/begin-authorization` (after `:state/pending`, before
+  `:state/starting`) is universal across all ceremonies. Reshare-
+  flavored ceremonies add `:state/authorization-gate` later.
+- **Trivial PDP first.** A stub PDP returning permit/deny/etc.
+  by mode flag lands before any real policy logic. Chart shape
+  stays stable as the PDP grows.
+- **EDN throughout, not XML.** XACML's encoding pain is the
+  one thing we *don't* inherit.
+- **Capabilities and PDP RPC calls are duals** — same trust
+  roots, same verification, different choice of where the
+  decision is materialized. The chart doesn't distinguish.
+- **`:state/failed` is a single terminal state**; the result
+  payload's `:outcome` keyword distinguishes
+  `:rejected | :error | :aborted | :canceled`.
+
+**Stage 5c — business logic.** Substages, in order:
+
+1. **5c.0a — PDP scaffolding.** Add `policy.clj` (mode-flag stub),
+   add `:state/begin-authorization` to all 6 executable charts,
+   wire dispatch action + four decision events, add a smoke
+   exercising both permit-all and deny-all modes, add a
+   conformance assertion that `:state/starting` is unreachable
+   except via the gate. **This is the immediate next step.**
+2. **5c.0b — Foundational-principle compliance.** IC pubkey
+   user-supplied at keygen (not Figure-default); KYC TAS as
+   separate principal type with own pubkey in address-policy.
+3. **5c.1 — Persistent registries.** Address-policy + commitment
+   registries that survive orchestrator restarts.
+4. **5c.2 — Attestation-issuance ceremonies.** TAS as fourth-
+   party type. PDP starts validating attestation signatures —
+   first non-trivial policy evaluation.
+5. **5c.3 — Multi-party authorization gates.** Reshare-flavored
+   ceremonies grow `:state/authorization-gate`. Real declarative
+   policy DSL (likely `stroopwafel`-driven) replaces the trivial PDP.
+6. **5c.4 — Objection windows.** First ceremony with a real wait
+   state (per pattern #10).
+7. **5c.5 — End-to-end UC2 with policy gating.** The first
+   ceremony the system can REFUSE.
+
+Adding a new ceremony reduces to:
 
 1. Write the executable chart in `specs/executable/<name>.edn`,
    following `docs/statechart-best-practices.md` (especially the
-   `fsm/assign` gotcha in pattern #1).
+   `fsm/assign` / `defaction` gotcha in pattern #1 and the
+   wait-state pattern in pattern #10).
 2. Add ceremony-specific actions to
    `orchestrator/.../chart_driven.clj` if finalization needs them
-   (most ceremonies reuse the existing actions; add a
-   `<name>-consistency-check` if you have a real check, otherwise
-   alias `:action/<name>-shape-check` to `check-results-collected`).
+   (most ceremonies reuse `check-results-collected`; add a
+   `<name>-consistency-check` if you have a real cross-party
+   check via `defaction`).
 3. Add a `run-<name>-via-chart` entry point with `make-begin` and
    `build-result` closures.
-4. Optionally add a smoke runner in `orchestrator/dev/`.
+4. Add a smoke runner in `orchestrator/dev/`.
+5. **From 5c.0a onward**: ensure the chart includes
+   `:state/begin-authorization` after `:state/pending`, routing
+   the four PDP decisions correctly.
 
 **Working entry pattern for a fresh session:**
 
@@ -475,11 +528,16 @@ Adding a new ceremony in Stage 5c reduces to:
    `mpc-multi-signature,statechart,clj-statecharts,best-practices`
    for the chart-driven runtime patterns; for tag
    `signet,planned-enhancement` for the signet roadmap.
-3. Skim `docs/statechart-best-practices.md` if you'll be writing a
-   chart; `docs/recovery-exploration-harness-design.md` Appendix E +
-   F for transport / share-possession architecture.
-4. `git log --oneline -20` for the recent narrative.
-5. Pick a Stage 5c sub-piece (commitment registry, commitment-gated
-   reshare, attestation-issuance, etc.) and start.
+3. **For 5c work, read `docs/policy-enforced-statechart-processing.md`
+   first** — it captures the architectural decisions (decision
+   model, trust-roots view, capability/PDP unification) that will
+   shape every 5c ceremony.
+4. Also skim `docs/statechart-best-practices.md` if you'll be
+   writing a chart; `docs/recovery-exploration-harness-design.md`
+   Appendix E + F for transport / share-possession architecture.
+5. `git log --oneline -20` for the recent narrative. Most recent
+   tag: `v0.7.1-review-feedback-applied`.
+6. Pick a Stage 5c sub-piece — start with 5c.0a unless you have
+   reason to skip ahead.
 
 Good luck. Ask early, test often.
